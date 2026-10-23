@@ -1,0 +1,33 @@
+# Lokale Notizen und Sicherungen
+CLAUDE.md
+CLAUDE.md.*
+**/CLAUDE.md
+**/CLAUDE.md.*
+*.alt
+*.alt-*
+*.bak
+*.bak*
+*.log
+
+# Eigene Logo-Texte (lokal)
+pcdeck/firmware/include/logo_local.h
+pcdeck/pc-app/logo_local.py
+
+# Python / PyInstaller
+__pycache__/
+*.pyc
+pcdeck/pc-app/.venv/
+pcdeck/pc-app/build/
+pcdeck/pc-app/dist/
+pcdeck/pc-app/*.spec
+
+# PlatformIO
+pcdeck/firmware/.pio/
+pcdeck/firmware/.vscode/
+
+# Installer-Ausgabe
+pcdeck/installer/Output/
+
+# Gehäuse: Zwischenstände und veraltete Teile
+pcdeck/gehaeuse/_tmp_details/
+pcdeck/gehaeuse/pcdeck_klemme.*

@@ -1,0 +1,6 @@
+# Deck 2 (klassischer ESP32, 4 MB Flash): ohne OTA – 2 MB Programm, Rest für Kacheln/Design (LittleFS)
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000
+phy_init, data, phy,     0xe000,   0x1000
+app0,     app,  factory, 0x10000,  0x200000
+spiffs,   data, spiffs,  0x210000, 0x1F0000
