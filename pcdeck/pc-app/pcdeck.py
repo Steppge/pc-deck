@@ -11,8 +11,10 @@ import ctypes
 import logging
 import os
 import queue
+import socket
 import subprocess
 import sys
+import threading
 import tkinter as tk
 
 from PIL import Image, ImageDraw
@@ -42,13 +44,41 @@ def setup_logging():
     )
 
 
+INSTANCE_PORT = 5557  # lokaler Port als zweite Sperre gegen Mehrfachstart (nur 127.0.0.1)
+
+
 def single_instance():
-    """Nur eine App-Instanz zulassen (sonst streiten sich zwei um die COM-Ports)."""
-    if os.name != "nt":
-        return True
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "PCDeck_SingleInstance")
-    single_instance.handle = handle  # Referenz halten
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    """Nur eine App-Instanz zulassen (sonst streiten sich zwei um die COM-Ports).
+
+    Zwei Sperren: Windows-Mutex und ein belegter lokaler Port. Der Port wirkt auch dann, wenn eine
+    Instanz aus einer Store-App (MSIX, z. B. der Claude-App) gestartet wurde – deren Mutex-Namensraum
+    kann getrennt sein. Rückgabe: Socket der Sperre (offen halten) oder None, wenn schon eine läuft.
+    """
+    if os.name == "nt":
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        single_instance.handle = k32.CreateMutexW(None, False, "PCDeck_SingleInstance")  # Referenz halten
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    try:
+        sock.bind(("127.0.0.1", INSTANCE_PORT))
+        sock.listen(2)
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+def wake_running():
+    """Laufende Instanz bitten, ihr Fenster zu zeigen. True, wenn sie geantwortet hat."""
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=2) as c:
+            c.sendall(b"SHOW\n")
+            return c.recv(16).startswith(b"OK")
+    except OSError:
+        return False
 
 
 def tray_image(connected):
@@ -115,6 +145,24 @@ class App:
             ),
         )
 
+    def listen(self, sock):
+        """Zweiter Start von PC-Deck meldet sich hier: Konfigurationsfenster zeigen."""
+        def loop():
+            while True:
+                try:
+                    conn, _ = sock.accept()
+                except OSError:
+                    return
+                with conn:
+                    try:
+                        conn.settimeout(2)
+                        if conn.recv(16).startswith(b"SHOW"):
+                            self.ui_queue.put(("open", None))
+                            conn.sendall(b"OK\n")
+                    except OSError:
+                        pass
+        threading.Thread(target=loop, daemon=True).start()
+
     def run(self):
         self.icon.run_detached()
         self.manager.start()
@@ -178,10 +226,15 @@ class App:
 
 def main():
     setup_logging()
-    if not single_instance():
-        ctypes.windll.user32.MessageBoxW(None, "PC-Deck läuft bereits (Symbol im Infobereich).", APP_NAME, 0x40)
+    lock = single_instance()
+    if not lock:
+        logging.info("PC-Deck läuft bereits – zweiter Start beendet")
+        if not wake_running():
+            ctypes.windll.user32.MessageBoxW(None, "PC-Deck läuft bereits (Symbol im Infobereich).", APP_NAME, 0x40)
         return
-    App().run()
+    app = App()
+    app.listen(lock)
+    app.run()
 
 
 if __name__ == "__main__":

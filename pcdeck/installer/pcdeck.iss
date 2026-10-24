@@ -7,7 +7,7 @@
 ; mit gelöscht werden sollen (Standard: nein).
 
 #define AppName "PC-Deck"
-#define AppVersion "1.5.0"
+#define AppVersion "1.5.1"
 #define AppPublisher "PC-Deck"
 #define AppExe "PC-Deck.exe"
 

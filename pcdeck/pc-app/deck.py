@@ -825,6 +825,7 @@ class DeckManager(threading.Thread):
         self.links = {}          # deck_id -> DeckLink
         self.last_deleted = None  # (deck_id, seite, platz, kachel) – fürs Konfigurationsfenster
         self.busy_ports = set()
+        self.not_deck = set()     # (port, hwid) ohne Deck-Antwort – nicht ständig neu öffnen
         self.lock = threading.Lock()
         self.running = True
         self.rescan = threading.Event()
@@ -851,14 +852,17 @@ class DeckManager(threading.Thread):
             if self.links.get(link.deck_id) is link:
                 del self.links[link.deck_id]
             self.busy_ports.discard(link.port)
+            self.not_deck = {k for k in self.not_deck if k[0] != link.port}  # Deck startet evtl. gerade neu
         self.notify(f"Deck {self.config.deck(link.deck_id)['name']} getrennt")
 
     def _candidates(self):
-        ports = list(list_ports.comports())
+        """Nur Ports mit USB-Chips der Decks; andere Geräte (z. B. STM32 einer CNC) werden nie geöffnet.
+        Ein Port, der beim Abfragen kein Deck war, wird erst nach Ab- und Wiederanstecken neu gefragt."""
+        ports = [p for p in list_ports.comports() if p.vid in ESP_VIDS]
+        present = {(p.device, p.hwid) for p in ports}
         with self.lock:
-            free = [p for p in ports if p.device not in self.busy_ports]
-        esp = [p for p in free if p.vid in ESP_VIDS]
-        return esp or [p for p in free if p.vid is not None]
+            self.not_deck &= present  # abgesteckt: vergessen
+            return [p for p in ports if p.device not in self.busy_ports and (p.device, p.hwid) not in self.not_deck]
 
     def _probe(self, port):
         ser = serial.Serial()
@@ -892,11 +896,16 @@ class DeckManager(threading.Thread):
         except (serial.SerialException, OSError):
             pass
         ser.close()
-        return None
+        return False  # geöffnet, aber keine Deck-Antwort (None = Port belegt, später noch mal versuchen)
 
     def scan_once(self):
         for p in self._candidates():
             res = self._probe(p.device)
+            if res is False and p.vid != 0x303A:  # Espressif-USB ist immer ein ESP32 – weiter fragen
+                with self.lock:
+                    self.not_deck.add((p.device, p.hwid))
+                log.info("%s (%s) ist kein Deck – wird erst nach neuem Anstecken wieder gefragt",
+                         p.device, p.description)
             if not res:
                 continue
             ser, deck_id, deck_hash, fw, theme_hash = res
