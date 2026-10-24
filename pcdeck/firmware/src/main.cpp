@@ -9,6 +9,8 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <mbedtls/md.h>
@@ -42,13 +44,25 @@
 #ifndef LOGO_TM
 #define LOGO_TM 0
 #endif
-#define FW_VERSION "14"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
+#define FW_VERSION "16"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
                         // 5 = flimmerfreies Zeichnen (Seite im PSRAM), 6 = Plus-Kachel (CLR, leere Plätze),
                         // 7 = Löschen per Sicherheitsabfrage (DEL), 8 = Design (Startbild, Seitenbild, Glas-Kacheln),
                         // 9 = ohne Verbindung zur PC-App nur das Logo, 10 = Drehgeber (ROT, KNOB, KNOBLONG),
                         // 11 = gedrückt drehen (ROTP), Wert-Anzeige (OSD), 12 = WLAN (TCP, Kopplung, Suche),
                         // 13 = WLAN im USB-Betrieb aus, ohne USB Abfrage "WLAN einschalten?",
-                        // 14 = Logo-Text fest pro Deck, Abfrage per LOGO
+                        // 14 = Logo-Text fest pro Deck, Abfrage per LOGO,
+                        // 15 = Seitenbild ohne PSRAM aus dem Flash, Logo im WLAN erst nach 12 s,
+                        // 16 = Firmware-Update über die Verbindung (FWINFO, FWBEGIN, FWDATA, FWEND)
+// Deck-Typ: die PC-App spielt nur eine Firmware mit demselben Typ auf
+#ifndef DECK_TYPE
+#if CONFIG_IDF_TARGET_ESP32S3
+#define DECK_TYPE "s3_ts35"
+#else
+#define DECK_TYPE "esp32_tft35"
+#endif
+#endif
+// Kennung in der .bin, an der die PC-App Version und Typ einer Firmware-Datei erkennt
+__attribute__((used)) static const char FW_TAG[] = "PCDECK-FW " FW_VERSION " " DECK_TYPE " ";
 // Drehgeber (EC11): A/B und Taster gegen GND, interne Pull-ups. -1 = kein Drehgeber angeschlossen.
 #ifndef PIN_ENC_A
 #define PIN_ENC_A -1
@@ -73,7 +87,8 @@
 #define DISC_PORT 5556  // UDP: Suche der PC-App ("PCDECK?" -> "PCDECK <id> <port> <fw> <belegt>")
 #define WIFI_USB_OFF_MS 30000  // so lange darf WLAN im USB-Betrieb noch an bleiben (z. B. nach dem Einrichten)
 #define NO_USB_ASK_MS 3000     // so lange ohne USB-PC, dann die Abfrage "WLAN einschalten?"
-#define PC_TIMEOUT_MS 5000  // so lange ohne Nachricht der PC-App -> nur noch das Logo
+#define PC_TIMEOUT_MS 5000    // so lange ohne Nachricht der PC-App -> nur noch das Logo
+#define NET_TIMEOUT_MS 12000  // dasselbe im WLAN (Funkaussetzer überbrücken)
 #define BOOT_LOGO_MS 3000   // so lange bleibt das Startbild stehen (Berühren = Touch kalibrieren)
 #define LONG_MS 600     // ab so langem Drücken gilt ein Tipper als "lang" (Rahmen gelb, beim Loslassen LONG)
 #define DELETE_MS 1500  // ab so langem Drücken: Sicherheitsabfrage "Kachel loeschen?" (Rahmen rot)
@@ -113,7 +128,23 @@ struct Theme {
   uint8_t alpha = 204;                    // Deckkraft der Kacheln
 };
 static Theme theme;
-static uint16_t* pageBg = nullptr;  // Seitenbild 240x160 im RAM/PSRAM
+static uint16_t* pageBg = nullptr;  // Seitenbild 240x160 im PSRAM
+static File pageBgFile;             // ohne PSRAM: Seitenbild zeilenweise aus dem LittleFS lesen
+static uint16_t bgRowBuf[240];
+static int bgRowY = -1;
+
+static bool hasPageBg() { return pageBg || pageBgFile; }
+
+// eine Zeile des Seitenbilds (0..159)
+static const uint16_t* bgRow(int y) {
+  if (pageBg) return pageBg + y * 240;
+  if (y != bgRowY) {
+    pageBgFile.seek((size_t)y * 240 * 2);
+    if (pageBgFile.read((uint8_t*)bgRowBuf, sizeof(bgRowBuf)) != sizeof(bgRowBuf)) memset(bgRowBuf, 0, sizeof(bgRowBuf));
+    bgRowY = y;
+  }
+  return bgRowBuf;
+}
 
 struct Tile {
   uint8_t page;
@@ -214,7 +245,7 @@ static void drawBgTo(LGFX_Sprite& s, int ox, int oy, int X0 = INT16_MIN, int Y0 
   }
   for (int Y = Y0; Y < Y0 + H; Y++) {
     if (Y < 0 || Y >= SCREEN_H) continue;
-    const uint16_t* src = pageBg + (Y / 2) * PAGE_W;
+    const uint16_t* src = bgRow(Y / 2);
     for (int X = X0; X < X0 + W; X++) {
       uint16_t* p = spritePx(s, ox, oy, X, Y);
       if (p) *p = (X >= 0 && X < SCREEN_W) ? swap16(src[X / 2]) : swap16(COL_BG);
@@ -271,7 +302,7 @@ static void drawBorderTo(LGFX_Sprite& s, int ox, int oy) {
   }
 }
 
-static bool fancy(LGFX_Sprite* spr) { return theme.on && pageBg && spr; }
+static bool fancy(LGFX_Sprite* spr) { return theme.on && hasPageBg() && spr; }
 
 // ---------------------------------------------------------------- Zeichnen
 // Gezeichnet wird immer erst unsichtbar in einen Zwischenspeicher (Sprite) und dann auf
@@ -596,7 +627,15 @@ static void clearStore() {
 
 // ---------------------------------------------------------------- Design laden
 static void loadPageBg() {
-  if (!pageBg) pageBg = (uint16_t*)(psramFound() ? ps_malloc(PAGE_BYTES) : malloc(PAGE_BYTES));
+  if (pageBgFile) pageBgFile.close();
+  bgRowY = -1;
+  if (!psramFound()) {
+    // klassischer ESP32: 77 KB RAM fehlen sonst dem WLAN und den Live-Icons
+    pageBgFile = LittleFS.open(PAGE_IMG, "r");
+    if (pageBgFile && pageBgFile.size() != PAGE_BYTES) pageBgFile.close();
+    return;
+  }
+  if (!pageBg) pageBg = (uint16_t*)ps_malloc(PAGE_BYTES);
   File f = LittleFS.open(PAGE_IMG, "r");
   bool ok = pageBg && f && f.size() == PAGE_BYTES && f.read((uint8_t*)pageBg, PAGE_BYTES) == PAGE_BYTES;
   if (f) f.close();
@@ -687,6 +726,9 @@ static bool loadCalibration() {
 //   OSD <prozent|-> <text>          -> Wert-Anzeige für 1,2 s über der Seite (z. B. "OSD 45 Lautstaerke")
 //   TDIAG                          -> Wartung: Touch-Rohwerte (TRAW ...) und MISO-Pegel (TMISO ...)
 //   LOGO                           -> LOGO <widmung-hex> <name-hex> <tm 0/1> (ab FW 14, fürs Startbild der App)
+//   FWINFO                         -> FWINFO <fw> <typ> <platz> (ab FW 16; platz = max. Größe der .bin)
+//   FWBEGIN <bytes> <md5>, FWDATA <n> + Daten (<= 4096), FWEND   (nur USB) Firmware aufspielen, Neustart
+//   FWABORT                        Firmware-Übertragung abbrechen
 // WLAN (ab FW 12; Texte als Hex, weil Namen/Passwörter Leerzeichen enthalten können):
 //   Anmeldung über TCP (gegenseitig, der Schlüssel aus der Kopplung geht nie übers Netz):
 //     PC: AUTH1 <nonce_pc>  -> Deck: CHAL <nonce_deck> <HMAC-SHA256(schlüssel, "D" + nonce_pc)>
@@ -881,6 +923,31 @@ static void handleWifi(char* arg) {
   }
 }
 
+// ---------------------------------------------------------------- Firmware-Update
+static size_t fwTotal = 0, fwDone = 0;
+static int fwShown = -1;
+
+static void drawFwProgress(const char* text) {
+  int pct = fwTotal ? (int)(fwDone * 100 / fwTotal) : 0;
+  tft.startWrite();
+  if (fwShown < 0) {
+    tft.fillScreen(COL_BG);
+    tft.setTextDatum(middle_center);
+    tft.setFont(&fonts::FreeSansBold12pt7b);
+    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.drawString("Firmware-Update", SCREEN_W / 2, 110);
+    tft.drawRect(60, 150, SCREEN_W - 120, 24, COL_DIM);
+  }
+  tft.fillRect(62, 152, (SCREEN_W - 124) * pct / 100, 20, COL_ACCENT);
+  tft.fillRect(0, 190, SCREEN_W, 40, COL_BG);
+  tft.setFont(&fonts::FreeSans9pt7b);
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString(text ? String(text) : String(pct) + " %  -  USB nicht trennen", SCREEN_W / 2, 205);
+  tft.endWrite();
+  fwShown = pct;
+}
+
 static void handleLine(char* line) {
   lastPcContact = millis();
   bool firstContact = !pcSeen;
@@ -1044,8 +1111,11 @@ static void handleLine(char* line) {
       return;
     }
     imgFile.close();
+    bool page = imgName == PAGE_IMG;
+    if (page && pageBgFile) pageBgFile.close();
     LittleFS.remove(imgName);
     LittleFS.rename(imgName + ".tmp", imgName);
+    if (page && theme.on) loadPageBg();
     io->println("ACK");
   } else if (strncmp(line, "THEME ", 6) == 0) {
     // THEME off | THEME <hash> <kachel oben> <kachel unten> <rand oben> <rand unten> <stil> <deckkraft>
@@ -1074,7 +1144,7 @@ static void handleLine(char* line) {
     }
     root.close();
     io->printf("FS %u %u theme=%d pagebg=%d\n", (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
-                  theme.on ? 1 : 0, pageBg ? 1 : 0);
+                  theme.on ? 1 : 0, hasPageBg() ? 1 : 0);
     io->println("ACK");
   } else if (strncmp(line, "OSD ", 4) == 0) {
     // OSD <prozent|-> <text>
@@ -1116,6 +1186,68 @@ static void handleLine(char* line) {
     io->println("ACK");
   } else if (strcmp(line, "LOGO") == 0) {
     io->printf("LOGO %s %s %d\n", toHex(LOGO_DEDICATION).c_str(), toHex(LOGO_NAME).c_str(), LOGO_TM ? 1 : 0);
+    io->println("ACK");
+  } else if (strcmp(line, "FWINFO") == 0) {
+    const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+    io->printf("FWINFO %s%u\n", FW_TAG + 10, next ? (unsigned)next->size : 0u);  // FW_TAG: "PCDECK-FW <fw> <typ> "
+    io->println("ACK");
+  } else if (strncmp(line, "FWBEGIN ", 8) == 0) {
+    unsigned n = 0;
+    char md5[40] = {0};
+    if (fromNet) {
+      io->println("ERR usb");  // Firmware nur per USB
+      return;
+    }
+    if (sscanf(line + 8, "%u %39s", &n, md5) != 2 || strlen(md5) != 32) {
+      io->println("ERR fwbegin");
+      return;
+    }
+    if (Update.isRunning()) Update.abort();
+    if (!Update.begin(n, U_FLASH)) {
+      io->printf("ERR fw %s\n", Update.errorString());
+      return;
+    }
+    Update.setMD5(md5);
+    fwTotal = n;
+    fwDone = 0;
+    fwShown = -1;
+    drawFwProgress(nullptr);
+    io->println("ACK");
+  } else if (strncmp(line, "FWDATA ", 7) == 0) {
+    static uint8_t fblk[4096];
+    unsigned n = atoi(line + 7);
+    if (!Update.isRunning() || n == 0 || n > sizeof(fblk) || fwDone + n > fwTotal) {
+      io->println("ERR fwdata");
+      return;
+    }
+    if (readExact(fblk, n) != n) {
+      io->println("ERR short");
+      return;
+    }
+    if (Update.write(fblk, n) != n) {
+      io->printf("ERR fw %s\n", Update.errorString());
+      return;
+    }
+    fwDone += n;
+    if ((int)(fwDone * 100 / fwTotal) != fwShown) drawFwProgress(nullptr);
+    io->println("ACK");
+  } else if (strcmp(line, "FWEND") == 0) {
+    if (!Update.isRunning() || fwDone != fwTotal || !Update.end()) {
+      io->printf("ERR fw %s\n", Update.errorString());
+      if (Update.isRunning()) Update.abort();
+      fwShown = -1;
+      drawPage();
+      return;
+    }
+    drawFwProgress("Fertig - Neustart ...");
+    io->println("ACK");
+    io->flush();
+    delay(500);
+    ESP.restart();
+  } else if (strcmp(line, "FWABORT") == 0) {
+    if (Update.isRunning()) Update.abort();
+    fwShown = -1;
+    drawPage();
     io->println("ACK");
   } else if (strcmp(line, "PING") == 0) {
     io->println("ACK");  // Lebenszeichen der PC-App (ab FW 4)
@@ -1625,7 +1757,7 @@ void setup() {
 
 // Statuspunkt aktualisieren: PC-App gilt als getrennt, wenn sie sich PC_TIMEOUT_MS nicht meldet
 static void pollPcStatus() {
-  if (!pcOk || millis() - lastPcContact < PC_TIMEOUT_MS) return;
+  if (!pcOk || millis() - lastPcContact < (viaNet ? NET_TIMEOUT_MS : PC_TIMEOUT_MS)) return;
   pcOk = false;  // App meldet sich nicht mehr (Herunterfahren, Abmelden, Standby, beendet): Logo
   confirmActive = false;
   downTile = -1;

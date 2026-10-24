@@ -13,6 +13,16 @@ if not defined ISCC (
   goto :fehler
 )
 
+echo [0/2] Firmware bauen (wird mit ins Setup gepackt) ...
+set "PIO=%USERPROFILE%\.platformio\penv\Scripts\pio.exe"
+if not exist "%PIO%" (
+  echo PlatformIO nicht gefunden: %PIO%
+  goto :fehler
+)
+pushd "%HERE%..\firmware" || goto :fehler
+"%PIO%" run -e deck_s3_ts35 -e deck_esp32_tft35 || (popd & goto :fehler)
+popd
+
 echo [1/2] PC-Deck.exe bauen ...
 taskkill /F /IM PC-Deck.exe >nul 2>&1
 pushd "%HERE%..\pc-app" || goto :fehler

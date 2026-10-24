@@ -10,6 +10,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import ImageTk
 
+import fwfile
 import iconextract
 import knob
 import plugin_api
@@ -1128,6 +1129,167 @@ class WifiDialog(tk.Toplevel):
         self._send(f"WIFI EN {1 if on else 0}", 5, lambda ok, lines: self.after(1500 if ok else 0, self.refresh))
 
 
+# ======================================================================= Firmware-Dialog
+class FirmwareDialog(tk.Toplevel):
+    """Firmware des Decks über die bestehende USB-Verbindung aktualisieren (ab FW 16)."""
+
+    def __init__(self, parent, manager, deck_id):
+        super().__init__(parent)
+        self.title("Firmware des Decks")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.manager, self.deck_id = manager, deck_id
+        self.results = queue.Queue()
+        self.busy = False
+        self.deck_type, self.slot = None, 0
+        self.bundled = fwfile.bundled()
+        link = manager.link(deck_id)
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        via = "nicht verbunden" if not link else (f"über {link.port}" if link.via_wlan else f"über USB ({link.port})")
+        self.deck_lbl = ttk.Label(f, text=f"Deck: Firmware {link.fw if link else '?'}, {via}")
+        self.deck_lbl.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.bundle_lbl = ttk.Label(f, text="")
+        self.bundle_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self.bar = ttk.Progressbar(f, length=440, maximum=1000)
+        self.bar.grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 4))
+        self.status = ttk.Label(f, text="", wraplength=440, justify="left")
+        self.status.grid(row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=440,
+                  text="Die neue Firmware wird über das USB-Kabel übertragen und in den zweiten Programm-Platz "
+                       "des Decks geschrieben. Erst wenn alles vollständig und die Prüfsumme richtig ist, startet "
+                       "das Deck mit ihr neu – bei einem Abbruch läuft die alte Firmware einfach weiter. Kacheln, "
+                       "Design, WLAN und Touch-Kalibrierung bleiben erhalten.").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        b = ttk.Frame(f)
+        b.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        self.bundle_btn = tip(ttk.Button(b, text="Mitgelieferte aufspielen", command=self.flash_bundled),
+                              "Die Firmware, die mit dieser App-Version geliefert wurde, aufs Deck spielen.")
+        self.bundle_btn.pack(side="left", padx=4)
+        self.file_btn = tip(ttk.Button(b, text="Datei wählen ...", command=self.flash_file),
+                            "Eine andere PC-Deck-Firmware (.bin) aufspielen, z. B. eine selbst gebaute "
+                            "(.pio\\build\\<env>\\firmware.bin). Der Deck-Typ muss passen.")
+        self.file_btn.pack(side="left", padx=4)
+        self.close_btn = ttk.Button(b, text="Schließen", command=self.close)
+        self.close_btn.pack(side="left", padx=(12, 0))
+        for w in (self.bundle_btn, self.file_btn):
+            w.configure(state="disabled")
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        TileDialog._place_over(self, parent)
+        self.after(100, self._poll)
+        if not link:
+            self.status.configure(text="Das Deck ist nicht verbunden.")
+        elif link.fw < 16:
+            self.status.configure(text=f"Das Deck hat Firmware {link.fw}. Das Update aus der App geht erst ab "
+                                       "Firmware 16 – einmalig per USB mit PlatformIO aufspielen (siehe Anleitung).")
+        elif link.via_wlan:
+            self.status.configure(text="Firmware-Update geht nur, wenn das Deck per USB angesteckt ist.")
+        else:
+            self.status.configure(text="Deck wird abgefragt ...")
+
+            def work():
+                self.results.put((self._on_info, link.request("FWINFO", 5)))
+            threading.Thread(target=work, daemon=True).start()
+        self.grab_set()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                done, res = self.results.get_nowait()
+                done(*res)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    def _on_info(self, ok, lines):
+        parts = next((l.split() for l in lines if l.startswith("FWINFO ")), []) if ok else []
+        if len(parts) < 4:
+            self.status.configure(text=f"Abfrage fehlgeschlagen: {lines if not ok else 'keine FWINFO-Antwort'}")
+            return
+        self.deck_type, self.slot = parts[2], int(parts[3])
+        link = self.manager.link(self.deck_id)
+        self.deck_lbl.configure(text=f"Deck: Firmware {parts[1]}, {fwfile.type_name(self.deck_type)}, "
+                                     f"über USB ({link.port if link else '?'})")
+        b = self.bundled.get(self.deck_type)
+        self.bundle_lbl.configure(text=f"Mitgeliefert: Firmware {b[0]}" if b else
+                                  "Mitgeliefert: keine Firmware für diesen Deck-Typ")
+        self.bundle_btn.configure(state="normal" if b else "disabled")
+        self.file_btn.configure(state="normal")
+        self.status.configure(text="Bereit." if not b or b[0] > int(parts[1]) else
+                              "Das Deck ist schon auf dem Stand der mitgelieferten Firmware.")
+
+    def flash_bundled(self):
+        self._flash(self.bundled[self.deck_type][1])
+
+    def flash_file(self):
+        path = filedialog.askopenfilename(parent=self, title="Firmware wählen",
+                                          filetypes=[("Firmware", "*.bin"), ("Alle Dateien", "*.*")])
+        if path:
+            self._flash(path)
+
+    def _flash(self, path):
+        link = self.manager.link(self.deck_id)
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            messagebox.showerror("PC-Deck", f"Datei nicht lesbar:\n{e}", parent=self)
+            return
+        inf = fwfile.info(data)
+        if not inf:
+            messagebox.showerror("PC-Deck", "Das ist keine PC-Deck-Firmware (ab Firmware 16).", parent=self)
+            return
+        if inf[1] != self.deck_type:
+            messagebox.showerror("PC-Deck", f"Die Datei ist für {fwfile.type_name(inf[1])}, das Deck ist "
+                                            f"{fwfile.type_name(self.deck_type)}.", parent=self)
+            return
+        if self.slot and len(data) > self.slot:
+            messagebox.showerror("PC-Deck", "Die Firmware ist zu groß für den Programm-Platz des Decks.", parent=self)
+            return
+        if not link or link.via_wlan:
+            messagebox.showerror("PC-Deck", "Das Deck ist nicht per USB verbunden.", parent=self)
+            return
+        if inf[0] <= link.fw and not messagebox.askyesno(
+                "PC-Deck", f"Das Deck hat schon Firmware {link.fw}, die Datei ist Firmware {inf[0]}. "
+                           "Trotzdem aufspielen?", parent=self):
+            return
+        if not messagebox.askyesno("PC-Deck", f"Firmware {inf[0]} ({len(data):,} Byte) jetzt aufspielen?\n\n"
+                                              "USB-Kabel während der Übertragung nicht abziehen.".replace(",", "."),
+                                   parent=self):
+            return
+        self.busy = True
+        for w in (self.bundle_btn, self.file_btn, self.close_btn):
+            w.configure(state="disabled")
+        self.status.configure(text="Firmware wird übertragen ...")
+        link.request_firmware(data, lambda x: self.results.put((self._on_progress, (x,))),
+                              lambda ok, text: self.results.put((self._on_done, (ok, text))))
+
+    def _on_progress(self, x):
+        self.bar.configure(value=int(x * 1000))
+        self.status.configure(text=f"Firmware wird übertragen ... {int(x * 100)} %")
+
+    def _on_done(self, ok, text):
+        self.busy = False
+        self.close_btn.configure(state="normal")
+        self.status.configure(text=text if ok else f"Fehlgeschlagen: {text}\nDie alte Firmware läuft weiter.")
+        if ok:
+            self.bar.configure(value=1000)
+        else:
+            self.file_btn.configure(state="normal")
+            if self.bundled.get(self.deck_type):
+                self.bundle_btn.configure(state="normal")
+
+    def close(self):
+        if not self.busy:
+            self.destroy()
+
+
 # ======================================================================= Hauptfenster
 class ConfigWindow(tk.Toplevel):
     TILE_W, TILE_H = 120, 100
@@ -1262,6 +1424,9 @@ class ConfigWindow(tk.Toplevel):
         tip(ttk.Button(bottom, text="Speichern & ans Deck senden", command=self.save),
             "Änderungen speichern. Kacheln, Icons und Design werden nur übertragen, wenn sie sich "
             "geändert haben; die Drehknopf-Belegung gilt sofort.").pack(side="right", padx=6)
+        tip(ttk.Button(bottom, text="Firmware ...", command=self.edit_firmware),
+            "Firmware des Decks über das USB-Kabel aktualisieren (ab Firmware 16) – mitgeliefert oder "
+            "eigene .bin-Datei.").pack(side="right", padx=6)
         tip(ttk.Button(bottom, text="WLAN ...", command=self.edit_wifi),
             "Deck optional per WLAN anbinden: einmal per USB einrichten und koppeln, danach findet die App "
             "das Deck im WLAN, sobald es nicht per USB steckt.").pack(side="right", padx=6)
@@ -1602,6 +1767,9 @@ class ConfigWindow(tk.Toplevel):
                                 "USB anstecken.", parent=self)
             return
         WifiDialog(self, self.manager, self.config_store, self.deck_id)
+
+    def edit_firmware(self):
+        FirmwareDialog(self, self.manager, self.deck_id)
 
     def calibrate(self):
         link = self.manager.link(self.deck_id)

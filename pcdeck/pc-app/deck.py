@@ -311,6 +311,10 @@ class DeckError(IOError):
     """Deck antwortet mit ERR oder gar nicht (Verbindung kann trotzdem weiter bestehen)."""
 
 
+class DeckRefused(DeckError):
+    """Deck hat mit ERR geantwortet – es lebt, nur dieser Befehl ging nicht (z. B. ERR mem)."""
+
+
 class DeckLink(threading.Thread):
     LIVE_INTERVAL = 1.0  # Sekunden zwischen zwei Abfragen der Live-Kacheln
     PING_INTERVAL = 2.0  # Lebenszeichen ans Deck (FW 4: sonst roter Punkt "PC getrennt")
@@ -329,6 +333,7 @@ class DeckLink(threading.Thread):
         self.visible_page = 0        # welche Seite das Deck gerade zeigt
         self.live_sent = {}          # (seite, kachel) -> zuletzt gesendeter Zustand
         self.live_errors = set()
+        self.soft_logged = False  # ERR bei Live-Bildern nur einmal ins Log
         self.next_live = 0.0
         self.backlog = []            # PRESS/SHOW, die während einer Übertragung kamen
         self.manual_page = 0         # zuletzt selbst gewählte Seite (Ziel beim Zurückspringen)
@@ -401,8 +406,10 @@ class DeckLink(threading.Thread):
         line = self.ser.readline()
         return line.decode("ascii", "replace").strip() if line else None
 
-    def _cmd(self, text, payload=None, timeout=5.0, collect=None):
+    def _cmd(self, text, payload=None, timeout=None, collect=None):
         """Befehl senden und auf ACK warten; collect: Liste für die übrigen Antwortzeilen (z. B. NET ...)."""
+        if timeout is None:
+            timeout = 10.0 if self.via_wlan else 5.0  # WLAN: Funkaussetzer abwarten
         self.ser.write((text + "\n").encode("ascii", "replace"))
         if payload:
             # in Stücken senden, damit der Empfangspuffer des Decks nicht überläuft
@@ -417,7 +424,7 @@ class DeckLink(threading.Thread):
             if line == "ACK":
                 return True
             if line.startswith("ERR"):
-                raise DeckError(f"Deck meldet Fehler bei '{text.split()[0]}': {line}")
+                raise DeckRefused(f"Deck meldet Fehler bei '{text.split()[0]}': {line}")
             if line.startswith(("PRESS ", "LONG ", "SHOW ", "DEL ", "ROT", "KNOB")):
                 self.backlog.append(line)  # nach der Übertragung abarbeiten
             elif collect is not None:
@@ -436,6 +443,33 @@ class DeckLink(threading.Thread):
             return out.get(timeout=timeout + 10)
         except queue.Empty:
             return False, "Keine Antwort (Deck beschäftigt oder getrennt)"
+
+    def request_firmware(self, data, progress, done):
+        """Firmware aufspielen (ab FW 16, nur USB). Aus dem Link-Thread: progress(0..1), done(ok, text).
+        Danach startet das Deck neu; die Verbindung endet und der Manager findet es wieder."""
+        self.jobs.put(("fw", (data, progress, done)))
+
+    def _firmware(self, data, progress, done):
+        try:
+            self._cmd(f"FWBEGIN {len(data)} {hashlib.md5(data).hexdigest()}", timeout=30)
+            for k in range(0, len(data), 4096):
+                chunk = data[k:k + 4096]
+                self._cmd(f"FWDATA {len(chunk)}", chunk, timeout=15)
+                progress(min(1.0, (k + len(chunk)) / len(data)))
+            self._cmd("FWEND", timeout=30)  # Deck prüft die MD5 und startet dann neu
+        except DeckError as e:
+            try:
+                self._cmd("FWABORT")
+            except DeckError:
+                pass
+            done(False, str(e))
+            return False
+        except (serial.SerialException, OSError) as e:
+            done(False, f"Verbindung unterbrochen: {e}")
+            raise
+        log.info("Deck %s: Firmware aufgespielt (%d Byte), Neustart", self.deck_id, len(data))
+        done(True, "Firmware aufgespielt – das Deck startet neu.")
+        return True
 
     def _sync(self, force):
         cfg = self.manager.config.deck_copy(self.deck_id)
@@ -539,11 +573,11 @@ class DeckLink(threading.Thread):
                 continue
             label = ascii_label(t.get("label") or label or "")
             if t.get("text_only") or img is None:
-                self._cmd(f"UPD {p} {i} 0 {label}")
+                self._soft(f"UPD {p} {i} 0 {label}")
             else:
                 raw = iconextract.to_rgb565(theme.mono_icon(img) if theme.is_mono(cfg) else img)
-                self._cmd(f"UPD {p} {i} 1 {label}", raw)
-            self.live_sent[(p, i)] = state
+                self._soft(f"UPD {p} {i} 1 {label}", raw)
+            self.live_sent[(p, i)] = state  # auch bei ERR: nicht jede Sekunde neu versuchen
         self._plus_tile(cfg, p)
 
     def _plus_tile(self, cfg, p):
@@ -560,11 +594,20 @@ class DeckLink(threading.Thread):
         if want == self.ghost:
             return
         if self.ghost and self.ghost[0] == p and (not want or want[1] != self.ghost[1]):
-            self._cmd(f"CLR {p} {self.ghost[1]}")
+            self._soft(f"CLR {p} {self.ghost[1]}")
         if want:
             img = theme.mono_icon(sug["img"]) if theme.is_mono(cfg) else sug["img"]
-            self._cmd(f"UPD {p} {want[1]} 1 {ascii_label(sug['label'])}", iconextract.to_rgb565(img))
+            self._soft(f"UPD {p} {want[1]} 1 {ascii_label(sug['label'])}", iconextract.to_rgb565(img))
         self.ghost = want
+
+    def _soft(self, text, payload=None):
+        """Wie _cmd, aber ein ERR des Decks (z. B. kein Speicher für ein Live-Icon) trennt nicht."""
+        try:
+            self._cmd(text, payload)
+        except DeckRefused as e:
+            if not self.soft_logged:
+                self.soft_logged = True
+                log.warning("%s (%s) – weiter ohne dieses Bild", e, self.deck_id)
 
     def _show_page(self, page):
         """Seite am Deck zeigen (im Thread der Verbindung)."""
@@ -740,6 +783,10 @@ class DeckLink(threading.Thread):
                     elif job == "osd":
                         pct, text = arg
                         self._cmd(f"OSD {'-' if pct is None else int(pct)} {ascii_label(text, 40)}")
+                    elif job == "fw":
+                        if self._firmware(*arg):
+                            time.sleep(1.0)  # Deck startet neu – Verbindung beenden, Manager sucht neu
+                            break
                 except queue.Empty:
                     pass
                 while self.backlog:

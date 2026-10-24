@@ -7,7 +7,7 @@
 ; mit gelöscht werden sollen (Standard: nein).
 
 #define AppName "PC-Deck"
-#define AppVersion "1.4.0"
+#define AppVersion "1.5.0"
 #define AppPublisher "PC-Deck"
 #define AppExe "PC-Deck.exe"
 
@@ -40,6 +40,9 @@ Name: "autostart"; Description: "Mit Windows starten"; GroupDescription: "Zusät
 
 [Files]
 Source: "..\pc-app\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; Firmware für das Update aus der App (Fenster „Firmware ...“)
+Source: "..\firmware\.pio\build\deck_s3_ts35\firmware.bin"; DestDir: "{app}\firmware"; DestName: "pcdeck_s3_ts35.bin"; Flags: ignoreversion
+Source: "..\firmware\.pio\build\deck_esp32_tft35\firmware.bin"; DestDir: "{app}\firmware"; DestName: "pcdeck_esp32_tft35.bin"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"

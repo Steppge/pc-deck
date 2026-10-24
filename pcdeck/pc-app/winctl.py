@@ -227,6 +227,7 @@ def allow_foreground():
 def front_when_ready(tile, path, before=(), timeout=15.0, max_times=3):
     """Nach dem Start: neue Fenster des Programms nach vorne holen, sobald sie erscheinen (auch nach
     einem Startbild). Klickt der Benutzer inzwischen selbst woanders hin, bleibt alles, wie es ist."""
+    path = folder_target(path)
     if os.name != "nt":
         return
     folder = os.path.isdir(path)
@@ -291,8 +292,18 @@ def target_exe(tile, path):
     return target if target and target.lower().endswith(".exe") else None
 
 
+def folder_target(path):
+    """Verknüpfung (.lnk) auf einen Ordner -> dieser Ordner (dann wie eine Ordner-Kachel behandeln)."""
+    if path.lower().endswith(".lnk"):
+        target = iconextract.lnk_target(path)
+        if target and os.path.isdir(target):
+            return target
+    return path
+
+
 def find_windows(tile, path):
     """Hauptfenster des laufenden Programms bzw. Explorer-Fenster des Ordners (leer = läuft nicht)."""
+    path = folder_target(path)
     if os.name != "nt":
         return []
     if os.path.isdir(path):
@@ -365,6 +376,7 @@ def minimize_or_restore(tile, path):
 
 def close_if_running(tile, path):
     """Langer Tipper: höflich schließen. True, wenn etwas zum Schließen gefunden wurde."""
+    path = folder_target(path)
     if os.name != "nt":
         return False
     if os.path.isdir(path):
@@ -526,6 +538,7 @@ def foreground_folder():
 
 def is_foreground(tile, path):
     """Ist das Programm bzw. der Ordner dieser Kachel gerade im Vordergrund?"""
+    path = folder_target(path)
     if os.path.isdir(path):
         f = foreground_folder()
         return bool(f) and os.path.normcase(os.path.normpath(f)) == os.path.normcase(os.path.normpath(path))
