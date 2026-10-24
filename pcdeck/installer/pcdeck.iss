@@ -7,7 +7,10 @@
 ; mit gelöscht werden sollen (Standard: nein).
 
 #define AppName "PC-Deck"
-#define AppVersion "1.5.2"
+; Version kommt aus pc-app\version.py (build.bat übergibt /DAppVersion=...)
+#ifndef AppVersion
+  #error Version fehlt - bitte mit build.bat bauen
+#endif
 #define AppPublisher "PC-Deck"
 #define AppExe "PC-Deck.exe"
 

@@ -19,6 +19,8 @@ import winaudio
 import winctl
 import winkeys
 import winsecret
+from paths import APP_DIR
+from version import VERSION
 from deck import FOREGROUND_IGNORE, COLS_RANGE, MAX_PAGES, ROWS_RANGE, auto_apps, empty_page, tile_icon, tile_label
 
 try:
@@ -1298,7 +1300,7 @@ class ConfigWindow(tk.Toplevel):
         super().__init__(root)
         self.config_store = config
         self.manager = manager
-        self.title("PC-Deck – Konfiguration")
+        self.title(f"PC-Deck {VERSION} – Konfiguration")
         self.configure(bg=BG)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.photos = []
@@ -1419,7 +1421,8 @@ class ConfigWindow(tk.Toplevel):
         self.status.pack(side="left")
         ttk.Button(bottom, text="Schließen", command=self.close).pack(side="right")
         tip(ttk.Button(bottom, text="?", width=3, command=lambda: messagebox.showinfo(
-            "PC-Deck – so funktioniert's", APP_HELP, parent=self)), "Kurze Anleitung zu Deck, Kacheln und Drehknopf").pack(
+            "PC-Deck – so funktioniert's",
+            APP_HELP + f"\n\nPC-Deck {VERSION}   •   Einstellungen und Protokoll: {APP_DIR}", parent=self)), "Kurze Anleitung zu Deck, Kacheln und Drehknopf").pack(
             side="right", padx=(0, 6))
         tip(ttk.Button(bottom, text="Speichern & ans Deck senden", command=self.save),
             "Änderungen speichern. Kacheln, Icons und Design werden nur übertragen, wenn sie sich "
@@ -1496,6 +1499,7 @@ class ConfigWindow(tk.Toplevel):
         link = self.manager.link(self.deck_id)
         if link:
             txt = f"Deck verbunden über {link.port}" if link.via_wlan else f"Deck verbunden über USB ({link.port})"
+            txt += f", Firmware {link.fw}"
         else:
             txt = "Deck nicht verbunden – Änderungen werden beim Anstecken übertragen"
         n = sum(len(h) for h in (self.cfg.get("hidden") or []))

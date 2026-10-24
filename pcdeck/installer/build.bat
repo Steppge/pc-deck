@@ -31,7 +31,17 @@ popd
 
 echo [2/2] Installer bauen ...
 pushd "%HERE%" || goto :fehler
-"%ISCC%" /Q pcdeck.iss || (popd & goto :fehler)
+rem Version aus pc-app\version.py (VERSION = "x.y.z")
+set "VER="
+for /f "tokens=2 delims==" %%V in ('findstr /b /c:"VERSION" "%HERE%..\pc-app\version.py"') do set "VER=%%V"
+set "VER=%VER: =%"
+set "VER=%VER:"=%"
+if not defined VER (
+  echo Version in pc-app\version.py nicht gefunden.
+  popd & goto :fehler
+)
+echo Version %VER%
+"%ISCC%" /Q /DAppVersion=%VER% pcdeck.iss || (popd & goto :fehler)
 popd
 
 echo.

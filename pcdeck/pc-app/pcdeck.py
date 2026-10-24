@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw
 import pystray
 
 from deck import APP_DIR, Config, DeckManager
+from version import VERSION
 from config_gui import ConfigWindow
 
 try:
@@ -136,6 +137,8 @@ class App:
         self.icon = pystray.Icon(
             "pcdeck", tray_image(False), APP_NAME,
             menu=pystray.Menu(
+                pystray.MenuItem(f"{APP_NAME} {VERSION}", None, enabled=False),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Konfigurieren ...", lambda: self.ui_queue.put(("open", None)), default=True),
                 pystray.MenuItem("Alle Decks neu übertragen", lambda: self.ui_queue.put(("resync", None))),
                 pystray.MenuItem("Mit Windows starten", lambda: self.ui_queue.put(("autostart", None)),
@@ -183,7 +186,7 @@ class App:
         connected = self.manager.connected()
         self.icon.icon = tray_image(bool(connected))
         names = [self.config.deck(i)["name"] for i in connected]
-        self.icon.title = f"{APP_NAME} – " + (", ".join(names) if names else "kein Deck verbunden")
+        self.icon.title = f"{APP_NAME} {VERSION} – " + (", ".join(names) if names else "kein Deck verbunden")
         if self.window and self.window.winfo_exists():
             self.window.refresh_status()
             self.window._update_status()
