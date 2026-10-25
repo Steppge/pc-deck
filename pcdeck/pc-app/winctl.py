@@ -103,6 +103,20 @@ def _processes():
     return procs
 
 
+def ancestors(pid, depth=4):
+    """Programmnamen (klein) der Elternprozesse, nächster zuerst – z. B. steamwebhelper.exe -> [steam.exe]."""
+    procs = _processes()
+    out, seen = [], {pid}
+    while len(out) < depth:
+        parent = procs.get(pid, (0, ""))[0]
+        if not parent or parent in seen or parent not in procs:
+            break
+        seen.add(parent)
+        out.append(procs[parent][1])
+        pid = parent
+    return out
+
+
 def _family(match):
     """(Programm-Prozesse, Programm-Prozesse + alle von ihnen gestarteten Unterprozesse).
     Beispiel Steam: Das Fenster gehört nicht steam.exe, sondern steamwebhelper.exe."""

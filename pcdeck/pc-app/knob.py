@@ -64,13 +64,25 @@ def settings(cfg):
             "apps": {a.lower(): preset(p) for a, p in (k.get("apps") or {}).items()}}
 
 
+_last_choice = [None]
+
+
 def active_preset(cfg):
-    """(Programm im Vordergrund oder None, gültiges Preset): Preset des Programms, sonst die Standard-Belegung."""
+    """(Programm im Vordergrund oder None, gültiges Preset): Preset des Programms, sonst die Standard-Belegung.
+    Gehört das Fenster einem Hilfsprozess (z. B. steamwebhelper.exe), zählt das Programm, das ihn
+    gestartet hat (steam.exe)."""
     s = settings(cfg)
-    exe, _ = winctl.foreground_app()
+    exe, pid = winctl.foreground_app()
+    name = None
     if exe and exe in s["apps"]:
-        return exe, s["apps"][exe]
-    return exe, s["default"]
+        name = exe
+    elif pid:
+        name = next((a for a in winctl.ancestors(pid) if a in s["apps"]), None)
+    choice = (exe, name)
+    if choice != _last_choice[0]:
+        _last_choice[0] = choice
+        log.info("Drehknopf: %s -> %s", exe or "?", f"Preset {name}" if name else "Standard")
+    return (name or exe), (s["apps"][name] if name else s["default"])
 
 
 def parse_tile(ref):

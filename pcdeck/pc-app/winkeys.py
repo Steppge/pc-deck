@@ -12,6 +12,14 @@ user32 = ctypes.windll.user32
 
 INPUT_MOUSE, INPUT_KEYBOARD = 0, 1
 MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL, WHEEL_DELTA = 0x0800, 0x1000, 120
+MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_VIRTUALDESK = 0x0001, 0x8000, 0x4000
+GA_ROOT = 2
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+user32.WindowFromPoint.argtypes = [wt.POINT]
+user32.WindowFromPoint.restype = wt.HWND
+user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetAncestor.restype = wt.HWND
+user32.GetForegroundWindow.restype = wt.HWND
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 0x1, 0x2, 0x4
 
 
@@ -129,11 +137,50 @@ def type_text(text):
     _send(inputs)
 
 
+def _move_to(x, y):
+    """Mausbewegung als Eingabe (in der Reihenfolge mit dem Mausrad), Bildschirmpunkt x, y."""
+    vx, vy = user32.GetSystemMetrics(SM_XVIRTUALSCREEN), user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = max(2, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    vh = max(2, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    m = INPUT(type=INPUT_MOUSE)
+    m.u.mi = MOUSEINPUT(round((x - vx) * 65535 / (vw - 1)), round((y - vy) * 65535 / (vh - 1)), 0,
+                        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, 0, 0)
+    return m
+
+
+def _foreground_point():
+    """(Mauszeiger, Mitte des Vordergrundfensters) oder None, wenn der Zeiger schon darüber steht.
+    Rechnet in echten Bildschirmpunkten (DPI-bewusst nur für diesen Thread)."""
+    try:
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
+    except AttributeError:
+        pass
+    fg = user32.GetForegroundWindow()
+    cur = wt.POINT()
+    if not fg or not user32.GetCursorPos(ctypes.byref(cur)):
+        return None
+    if user32.GetAncestor(user32.WindowFromPoint(cur), GA_ROOT) == fg:
+        return None
+    rc = wt.RECT()
+    if not user32.GetClientRect(fg, ctypes.byref(rc)) or rc.right <= 0 or rc.bottom <= 0:
+        return None
+    mid = wt.POINT(rc.right // 2, rc.bottom // 2)
+    user32.ClientToScreen(fg, ctypes.byref(mid))
+    return (cur.x, cur.y), (mid.x, mid.y)
+
+
 def wheel(clicks, horizontal=False, ctrl=False, shift=False):
-    """Mausrad drehen (+ = nach oben bzw. rechts) – wirkt auf das Fenster unter dem Mauszeiger.
+    """Mausrad drehen (+ = nach oben bzw. rechts) im Programm im Vordergrund.
+    Windows schickt das Mausrad an das Fenster unter dem Mauszeiger – steht er woanders (anderer
+    Monitor, Taskleiste), wird er dafür kurz in die Fenstermitte gesetzt und gleich zurückgeholt.
     ctrl = Strg gedrückt halten (Zoomen), shift = Umschalt (in vielen Programmen seitlich scrollen)."""
     mods = ([0x11] if ctrl else []) + ([0x10] if shift else [])
     m = INPUT(type=INPUT_MOUSE)
     m.u.mi = MOUSEINPUT(0, 0, ctypes.c_uint32(int(clicks) * WHEEL_DELTA).value,
                         MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL, 0, 0)
-    _send([_key(v) for v in mods] + [m] + [_key(v, up=True) for v in reversed(mods)])
+    seq = [_key(v) for v in mods] + [m] + [_key(v, up=True) for v in reversed(mods)]
+    pts = _foreground_point()
+    if pts:
+        (cx, cy), (mx, my) = pts
+        seq = [_move_to(mx, my)] + seq + [_move_to(cx, cy)]
+    _send(seq)
