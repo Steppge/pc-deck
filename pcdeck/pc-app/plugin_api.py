@@ -43,7 +43,12 @@ class Field:
 
     kind: "text", "bool", "path" (Programm/Datei/Ordner mit Auswahl-Knöpfen),
           "file" (Datei-Auswahl), "choice" (Auswahlliste), "multi" (Häkchen-Liste,
-          Wert = Liste der angehakten Werte), "secret" (Passwort, DPAPI-verschlüsselt gespeichert).
+          Wert = Liste der angehakten Werte), "secret" (Passwort, DPAPI-verschlüsselt gespeichert),
+          "info" (nur Hinweistext, nicht gespeichert; label = Text, default = Link für „Download-Seite öffnen“
+          – beides darf eine Funktion sein, die beim Öffnen des Dialogs ausgewertet wird),
+          "links" (Schaltfläche, die ein Fenster mit Links öffnet; label = Beschriftung,
+          default = [(Überschrift, Hinweis, [(Name, Link, Beschreibung), ...]), ...]),
+          "tool" (Schaltfläche; default = Funktion(kachel_dialog), z. B. ein eigenes Fenster öffnen).
     choices: Liste von (wert, anzeige) oder Funktion, die so eine Liste liefert.
     enabled_by: Schlüssel eines bool-Feldes; das Feld ist nur aktiv, wenn dieses gesetzt ist.
     """
@@ -65,6 +70,7 @@ class Field:
 class TileType:
     id = ""
     name = ""
+    group = ""  # Gruppe in der Typ-Auswahl (leer = "Eigene Plugins"), siehe GROUPS
     fields = []
 
     def label(self, tile):
@@ -90,6 +96,18 @@ class TileType:
     def on_long_press(self, tile, ctx):
         """Langer Tipper (0,6 s, Deck-Firmware ab Version 3). Standard: wie kurz."""
         self.on_press(tile, ctx)
+
+    rotatable = False  # True = per Drehknopf einstellbar ("Kachel einstellen", z. B. Rollladen-Position)
+
+    def on_rotate(self, tile, ctx, steps):
+        """Drehknopf: steps Rasten (+ = rechts). Nur bei rotatable = True."""
+
+    def on_knob_press(self, tile, ctx):
+        """Drehknopf gedrückt, während er dieser Kachel gehört (siehe DeckLink.grab_knob)."""
+
+    def knob_osd(self, tile):
+        """(prozent oder None, text) für die Wert-Anzeige, solange der Drehknopf dieser Kachel gehört."""
+        return None
 
     live = False  # True = Live-Kachel (siehe LiveTileType)
     # Zustand, in dem die Kachel genau wie ihr gespeichertes Bild aussieht: dann muss nach einem
@@ -172,10 +190,41 @@ def get(tile_or_id):
     return _types.get(tid) or _Unknown(tid)
 
 
+# Gruppen der Typ-Auswahl im Kachel-Dialog, in dieser Reihenfolge; darin die eingebauten Typen in dieser
+# Reihenfolge. Eigene Plugins setzen `group` selbst (eine dieser Gruppen oder eine neue), sonst "Eigene Plugins".
+GROUPS = [
+    ("Programme", ["launch"]),
+    ("Tastatur & Text", ["hotkey", "text"]),
+    ("Medien", ["media", "nowplaying"]),
+    ("Audio", ["volume", "audio_output", "audio_profile", "mic_mute"]),
+    ("Soundboard", ["sound", "sound_stop_all"]),
+    ("Info & Zeit", ["clock", "cpu", "ram", "stopwatch", "timer"]),
+    ("Smart Home", ["bosch"]),
+    ("Streaming", ["obs"]),
+    ("Deck", ["page"]),
+]
+OWN_GROUP = "Eigene Plugins"
+
+
 def all_types():
     """Alle registrierten Typen, "launch" zuerst, Rest nach Namen."""
     load()
     return sorted(_types.values(), key=lambda t: (t.id != DEFAULT_TYPE, t.name.lower()))
+
+
+def grouped_types():
+    """[(Gruppe, [Typen, ...]), ...] für die Typ-Auswahl – Reihenfolge wie GROUPS, leere Gruppen fehlen."""
+    load()
+    group_of = {tid: g for g, ids in GROUPS for tid in ids}
+    rank = {tid: i for _, ids in GROUPS for i, tid in enumerate(ids)}
+    order = [g for g, _ in GROUPS]
+    buckets = {}
+    for t in _types.values():
+        g = t.group or group_of.get(t.id, OWN_GROUP)
+        buckets.setdefault(g, []).append(t)
+    names = order + sorted(g for g in buckets if g not in order and g != OWN_GROUP) + [OWN_GROUP]
+    return [(g, sorted(buckets[g], key=lambda t: (rank.get(t.id, 99), t.name.lower())))
+            for g in names if g in buckets]
 
 
 def plugin_dir():

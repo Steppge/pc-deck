@@ -281,6 +281,55 @@ def get_icon(path, custom_icon="", label=""):
         return img
 
 
+def pack_icon(raw):
+    """RGB565-Rohdaten (8192 Byte) mit Lauflängen packen (Firmware ab 22, siehe unpackIcon).
+    Steuerbyte c: c & 0x80 -> (c & 0x7F) + 1 mal das folgende Pixel, sonst c + 1 Pixel wörtlich.
+    Rückgabe: gepackte Bytes oder None, wenn das nicht kleiner wird (dann roh senden)."""
+    px = [raw[k] | (raw[k + 1] << 8) for k in range(0, len(raw), 2)]
+    out = bytearray()
+    lit = []
+
+    def flush():
+        while lit:
+            chunk = lit[:128]
+            del lit[:128]
+            out.append(len(chunk) - 1)
+            for v in chunk:
+                out.extend((v & 0xFF, v >> 8))
+
+    i, n = 0, len(px)
+    while i < n:
+        j = i
+        while j < n and j - i < 128 and px[j] == px[i]:
+            j += 1
+        if j - i >= 3:  # Wiederholung lohnt sich ab 3 gleichen Pixeln
+            flush()
+            out.append(0x80 | (j - i - 1))
+            out += bytes((px[i] & 0xFF, px[i] >> 8))
+            i = j
+        else:
+            lit.append(px[i])
+            i += 1
+    flush()
+    return bytes(out) if len(out) < len(raw) else None
+
+
+def unpack_icon(data):
+    """Gegenstück zu pack_icon (zum Prüfen)."""
+    out, i = bytearray(), 0
+    while i < len(data):
+        c = data[i]
+        i += 1
+        cnt = (c & 0x7F) + 1
+        if c & 0x80:
+            out += data[i:i + 2] * cnt
+            i += 2
+        else:
+            out += data[i:i + 2 * cnt]
+            i += 2 * cnt
+    return bytes(out)
+
+
 def to_rgb565(img):
     """64x64 RGB -> Rohdaten RGB565 little endian, wie die Firmware sie erwartet."""
     px = img.convert("RGB").tobytes()

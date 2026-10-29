@@ -20,6 +20,7 @@ import unicodedata
 import serial
 from serial.tools import list_ports
 
+import boschshc
 import iconextract
 import knob
 import netlink
@@ -99,15 +100,23 @@ class Config:
         with self.lock:
             return copy.deepcopy(self.data["decks"].get(deck_id))
 
+    def deck_view(self, deck_id):
+        """Wie deck_copy, dazu am Ende die SmartHome-Seite(n) – so, wie das Deck sie zeigt."""
+        cfg = self.deck_copy(deck_id)
+        return add_extra_pages(cfg) if cfg else cfg
+
     def set_deck(self, deck_id, cfg):
         with self.lock:
             self.data["decks"][deck_id] = copy.deepcopy(cfg)
             self.save()
 
     def set_tile(self, deck_id, page, idx, tile):
-        """Eine Kachel speichern (z. B. von der Plus-Kachel am Deck)."""
+        """Eine Kachel speichern (z. B. von der Plus-Kachel am Deck). SmartHome-Seiten sind nicht änderbar."""
         with self.lock:
-            self.data["decks"][deck_id]["pages"][page][idx] = copy.deepcopy(tile)
+            pages = self.data["decks"][deck_id]["pages"]
+            if page >= len(pages):
+                return
+            pages[page][idx] = copy.deepcopy(tile)
             self.save()
 
     def net_key(self, deck_id, create=False):
@@ -121,18 +130,29 @@ class Config:
                 self.save()
             return key or None
 
+    def deck_ports(self):
+        """USB-Kennungen (hwid) der Ports, an denen schon einmal ein Deck war."""
+        with self.lock:
+            return set(self.data.get("deck_ports") or [])
+
+    def add_deck_port(self, hwid):
+        with self.lock:
+            ports = self.data.setdefault("deck_ports", [])
+            if hwid and hwid not in ports:
+                ports.append(hwid)
+                self.save()
+
     def net_keys(self):
         with self.lock:
             ids = list((self.data.get("net_keys") or {}).keys())
         return {i: self.net_key(i) for i in ids}
 
     def tile(self, deck_id, page, idx):
-        with self.lock:
-            d = self.data["decks"].get(deck_id)
-            try:
-                return copy.deepcopy(d["pages"][page][idx])
-            except (TypeError, IndexError, KeyError):
-                return None
+        d = self.deck_view(deck_id)
+        try:
+            return d["pages"][page][idx]
+        except (TypeError, IndexError, KeyError):
+            return None
 
 
 def ascii_label(text, maxlen=24):
@@ -168,12 +188,84 @@ def build_payload(cfg):
             show_icon = not t.get("text_only")
             raw = b""
             if show_icon:
-                icon = tile_icon(t, label)
+                icon = tile_icon(dict(t, _slot=i), label)  # _slot: Platz (z. B. für automatische Farben)
                 raw = iconextract.to_rgb565(theme.mono_icon(icon) if mono else icon)
             tiles.append((p, i, label, raw))
             h.update(f"|{p},{i},{label},".encode())
             h.update(raw)
     return tiles, h.hexdigest()[:16]
+
+
+# ======================================================================= SmartHome-Seite
+SMARTHOME_TITLE = "SmartHome"
+SOUNDBOARD_TITLE = "Soundboard"
+
+
+def add_extra_pages(cfg):
+    """Automatische Seiten hinter den eigenen anhängen: erst Soundboard, dann SmartHome.
+    cfg["own_pages"] = Anzahl der eigenen Seiten, cfg["page_titles"] = {seite: Name in der Navigationsleiste}."""
+    cfg["own_pages"] = len(cfg["pages"])
+    cfg["page_titles"] = {}
+    add_soundboard_pages(cfg)
+    add_smarthome_pages(cfg)
+    return cfg
+
+
+def _append_pages(cfg, tiles, title):
+    """Kacheln auf neue Seiten verteilen (höchstens bis MAX_PAGES Seiten insgesamt)."""
+    per = cfg["cols"] * cfg["rows"]
+    for k in range(0, len(tiles), per):
+        if len(cfg["pages"]) >= MAX_PAGES:
+            break
+        page = empty_page(cfg["cols"], cfg["rows"])
+        for j, t in enumerate(tiles[k:k + per]):
+            page[j] = t
+        cfg["page_titles"][len(cfg["pages"])] = title
+        cfg["pages"].append(page)
+
+
+def add_soundboard_pages(cfg):
+    """Angehakte Sounds (cfg["soundboard"]["sounds"], Pfade) als Seite(n) „Soundboard“: vorne „Alle stoppen“,
+    dann die Sounds mit den gemeinsamen Einstellungen. Fehlende Dateien werden übersprungen."""
+    sb = cfg.get("soundboard") or {}
+    files = [f for f in sb.get("sounds") or [] if os.path.isfile(f)]
+    if not files:
+        return cfg
+    common = {k: sb.get(k, d) for k, d in (("volume", "100"), ("device", ""), ("device2", ""), ("mode", "overlay"))}
+    colors = sb.get("colors") or {}
+    tiles = [{"type": "sound_stop_all", "label": ""}] + [
+        dict(type="sound", file=f, label="", auto_color=n, color=colors.get(f, ""), **common)
+        for n, f in enumerate(files)]
+    _append_pages(cfg, tiles, SOUNDBOARD_TITLE)
+    return cfg
+
+
+def add_smarthome_pages(cfg):
+    """Angehakte Bosch-Geräte (cfg["smarthome"]["devices"]) als Seite(n) „SmartHome“ anhängen, solange ein
+    Controller gekoppelt ist."""
+    cfg.setdefault("page_titles", {})
+    devs = (cfg.get("smarthome") or {}).get("devices") or []
+    if not devs or not boschshc.paired():
+        return cfg
+    tiles = [{"type": "bosch", "device": d["id"], "kind": d.get("kind"), "device_name": d.get("name", ""),
+              "label": ""} for d in devs]
+    _append_pages(cfg, tiles, SMARTHOME_TITLE)
+    return cfg
+
+
+def app_title(cfg, page, exe):
+    """Anzeigename eines Programms für die Navigationsleiste: Beschriftung einer passenden Kachel auf der
+    Seite, sonst der Programmname ohne .exe."""
+    for t in cfg["pages"][page] if page < len(cfg["pages"]) else []:
+        if t and t.get("type", "launch") == "launch" and t.get("path"):
+            try:
+                target = winctl.target_exe(t, t["path"])
+            except Exception:
+                target = None
+            if target and ntpath.basename(target).lower() == exe and tile_label(t):
+                return tile_label(t)
+    stem = exe[:-4] if exe.endswith(".exe") else exe
+    return stem[:1].upper() + stem[1:]
 
 
 # ======================================================================= Automatischer Seitenwechsel
@@ -344,6 +436,9 @@ class DeckLink(threading.Thread):
         self.next_ping = 0.0
         self.locked_notice = 0.0     # letzter Hinweis "PC gesperrt" am Deck
         self.knob = knob.Worker(self.request_osd)  # Drehknopf (ab FW 10): Aktionen im eigenen Thread
+        self.knob_grab = None        # (seite, platz, bis): Drehknopf gehört gerade dieser Kachel (z. B. Rollladen)
+        self.next_grab_osd = 0.0     # solange: Wert-Anzeige laufend erneuern (das Deck zeigt sie nur 1,2 s)
+        self.titles_sent = {}        # seite -> Name in der Navigationsleiste (ab FW 17)
 
     # -- Aufrufe von außen (GUI/Tray)
     def request_sync(self, force=False):
@@ -360,6 +455,17 @@ class DeckLink(threading.Thread):
     def request_brightness(self, value):
         self.jobs.put(("bri", value))
 
+    def grab_knob(self, page, idx, seconds=8.0):
+        """Drehknopf für ein paar Sekunden einer Kachel geben (jede Bewegung verlängert)."""
+        self.knob_grab = (page, idx, time.time() + seconds)
+
+    def knob_grabbed(self, page, idx):
+        g = self.knob_grab
+        return bool(g) and g[:2] == (page, idx) and time.time() < g[2]
+
+    def request_titles(self):
+        self.jobs.put(("titles", None))
+
     def goto_page(self, page, manual=True):
         """Seite wechseln (z. B. von einer Kachel "Seite wechseln"); manual = wie selbst geblättert."""
         if manual:
@@ -368,12 +474,12 @@ class DeckLink(threading.Thread):
         self.jobs.put(("page", page))
 
     def page_count(self):
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         return len(cfg["pages"]) if cfg else 0
 
     def on_foreground(self, exe):
         """Automatischer Seitenwechsel: ein anderes Programm ist in den Vordergrund gekommen."""
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         if not cfg:
             return
         target = auto_page(cfg, exe)
@@ -382,19 +488,22 @@ class DeckLink(threading.Thread):
                 self.manual_page = self.visible_page
                 self.auto_active = True
             self.auto_exe = exe.lower()
+            self.request_titles()
             if target != self.visible_page:
                 log.info("%s im Vordergrund -> Seite %d", exe, target + 1)
                 self.jobs.put(("page", target))
         elif self.auto_active:
             self.auto_active = False
+            self.request_titles()
             if self.manual_page != self.visible_page and self.manual_page < len(cfg["pages"]):
                 log.info("%s im Vordergrund -> zurück auf Seite %d", exe, self.manual_page + 1)
                 self.jobs.put(("page", self.manual_page))
 
     def on_auto_app_ended(self):
         """Das Programm, das auf eine Automatik-Seite geschaltet hat, wurde beendet."""
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         self.auto_active = False
+        self.request_titles()
         log.info("%s beendet -> zurück auf Seite %d", self.auto_exe, self.manual_page + 1)
         self.auto_exe = None
         if cfg and self.manual_page != self.visible_page and self.manual_page < len(cfg["pages"]):
@@ -451,7 +560,11 @@ class DeckLink(threading.Thread):
 
     def _firmware(self, data, progress, done):
         try:
-            self._cmd(f"FWBEGIN {len(data)} {hashlib.md5(data).hexdigest()}", timeout=30)
+            md5 = hashlib.md5(data).hexdigest()
+            sig = ""
+            if self.via_wlan:  # ab FW 18: über WLAN nur mit Unterschrift (Kopplungsschlüssel)
+                sig = " " + netlink.proof(self.manager.config.net_key(self.deck_id) or "", f"F{md5}{len(data)}")
+            self._cmd(f"FWBEGIN {len(data)} {md5}{sig}", timeout=30)
             for k in range(0, len(data), 4096):
                 chunk = data[k:k + 4096]
                 self._cmd(f"FWDATA {len(chunk)}", chunk, timeout=15)
@@ -472,7 +585,7 @@ class DeckLink(threading.Thread):
         return True
 
     def _sync(self, force):
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         tiles, digest = build_payload(cfg)
         if not force and digest == self.deck_hash:
             return
@@ -481,7 +594,11 @@ class DeckLink(threading.Thread):
         for p, i, label, raw in tiles:
             self._cmd(f"TILE {p} {i} {1 if raw else 0} {label}")
             if raw:
-                self._cmd(f"ICON {p} {i} {len(raw)}", raw)
+                z = iconextract.pack_icon(raw) if self.fw >= 22 else None
+                if z:  # gepackt: weniger Speicher im Deck und schneller übertragen (ab FW 22)
+                    self._cmd(f"ICONZ {p} {i} {len(z)}", z)
+                else:
+                    self._cmd(f"ICON {p} {i} {len(raw)}", raw)
         self._cmd("END", timeout=10)
         self._cmd(f"BRI {int(cfg.get('brightness', 200))}")
         self.deck_hash = digest
@@ -491,13 +608,14 @@ class DeckLink(threading.Thread):
         self.live_sent.clear()
         self.ghost = None
         self.next_live = 0.0
+        self.titles_sent = {}  # BEGIN hat die Namen im Deck gelöscht
         self.manager.notify(f"{cfg['name']}: aktualisiert")
 
     def _sync_theme(self):
         """Design (Startbild, Seitenbild, Farben) übertragen, wenn es sich geändert hat (ab FW 8)."""
         if self.fw < 8:
             return
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         t = theme.settings(cfg) if cfg else None
         if t is None:
             return  # "Auf dem Deck lassen" (z. B. Deck von einem anderen PC): Design nicht anrühren
@@ -547,7 +665,7 @@ class DeckLink(threading.Thread):
         """Live-Kacheln der sichtbaren Seite abfragen und Änderungen ans Deck schicken."""
         if self.fw < 2:
             return
-        cfg = self.manager.config.deck_copy(self.deck_id)
+        cfg = self.manager.config.deck_view(self.deck_id)
         if not cfg or self.visible_page >= len(cfg["pages"]):
             return
         p = self.visible_page
@@ -576,7 +694,7 @@ class DeckLink(threading.Thread):
                 self._soft(f"UPD {p} {i} 0 {label}")
             else:
                 raw = iconextract.to_rgb565(theme.mono_icon(img) if theme.is_mono(cfg) else img)
-                self._soft(f"UPD {p} {i} 1 {label}", raw)
+                self._upd_icon(p, i, label, raw)
             self.live_sent[(p, i)] = state  # auch bei ERR: nicht jede Sekunde neu versuchen
         self._plus_tile(cfg, p)
 
@@ -585,7 +703,7 @@ class DeckLink(threading.Thread):
         if self.fw < 6:
             return
         want = None
-        if cfg.get("suggest", True):
+        if cfg.get("suggest", True) and p < cfg.get("own_pages", len(cfg["pages"])):
             page = cfg["pages"][p][:cfg["cols"] * cfg["rows"]]
             slot = next((i for i, t in enumerate(page) if not t), None)
             sug = current_suggestion() if slot is not None else None
@@ -597,8 +715,16 @@ class DeckLink(threading.Thread):
             self._soft(f"CLR {p} {self.ghost[1]}")
         if want:
             img = theme.mono_icon(sug["img"]) if theme.is_mono(cfg) else sug["img"]
-            self._soft(f"UPD {p} {want[1]} 1 {ascii_label(sug['label'])}", iconextract.to_rgb565(img))
+            self._upd_icon(p, want[1], ascii_label(sug["label"]), iconextract.to_rgb565(img))
         self.ghost = want
+
+    def _upd_icon(self, p, i, label, raw):
+        """Live-Kachel mit Icon schicken – ab FW 22 gepackt (meist 1-3 KB statt 8 KB, auch im RAM des Decks)."""
+        z = iconextract.pack_icon(raw) if self.fw >= 22 else None
+        if z:
+            self._soft(f"UPD {p} {i} 2 {len(z)} {label}", z)
+        else:
+            self._soft(f"UPD {p} {i} 1 {label}", raw)
 
     def _soft(self, text, payload=None):
         """Wie _cmd, aber ein ERR des Decks (z. B. kein Speicher für ein Live-Icon) trennt nicht."""
@@ -609,10 +735,75 @@ class DeckLink(threading.Thread):
                 self.soft_logged = True
                 log.warning("%s (%s) – weiter ohne dieses Bild", e, self.deck_id)
 
+    def _grab_osd(self):
+        """Gehört der Drehknopf einer Kachel: Wert-Anzeige alle 0,8 s erneuern, damit sie stehen bleibt."""
+        g = self.knob_grab
+        if not g or self.fw < 11 or time.time() < self.next_grab_osd:
+            return
+        if time.time() >= g[2]:
+            self.knob_grab = None
+            return
+        self.next_grab_osd = time.time() + 0.8
+        tile = self.manager.config.tile(self.deck_id, g[0], g[1])
+        tt = plugin_api.get(tile) if tile else None
+        if not tt:
+            return
+
+        def work():  # Abfrage beim Controller nicht im Thread der Verbindung
+            try:
+                v = tt.knob_osd(tile)
+            except Exception:
+                v = None
+            if v and self.knob_grab:
+                self.request_osd(*v)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _init_page(self):
+        """Welche Seite zeigt das Deck? Nach einem Neustart der App bleibt es auf seiner Seite – ohne
+        Abfrage würde die App die Live-Kacheln der falschen Seite schicken."""
+        page = None
+        if self.fw >= 17:
+            lines = []
+            try:
+                self._cmd("CURPAGE", collect=lines)
+                page = next((int(x.split()[1]) for x in lines if x.startswith("CURPAGE ")), None)
+            except (DeckError, ValueError):
+                page = None
+        if page is None:
+            self._cmd("PAGE 0")  # ältere Firmware: auf Seite 1 stellen, dann stimmen beide überein
+            page = 0
+        self.visible_page = self.manual_page = page
+        self.live_sent.clear()
+        self.next_live = 0.0
+
+    def _send_titles(self):
+        """Namen in der Navigationsleiste (ab FW 17): Soundboard- und SmartHome-Seiten fest, eine Automatik-Seite
+        zeigt den Namen des Programms, das sie ausgelöst hat. Alle anderen Seiten zeigen ihre Nummer."""
+        if self.fw < 17:
+            return
+        cfg = self.manager.config.deck_view(self.deck_id)
+        if not cfg:
+            return
+        want = dict(cfg.get("page_titles") or {})
+        if self.auto_active and self.auto_exe:
+            ap = auto_page(cfg, self.auto_exe)
+            if ap is not None:
+                want[ap] = app_title(cfg, ap, self.auto_exe)
+        for p in set(want) | set(self.titles_sent):
+            text = want.get(p, "")
+            if self.titles_sent.get(p, "") != text:
+                arg = ascii_label(text, 28).encode("ascii").hex() if text else "-"
+                self._cmd(f"TITLE {p} {arg}")
+                if text:
+                    self.titles_sent[p] = text
+                else:
+                    self.titles_sent.pop(p, None)
+
     def _show_page(self, page):
         """Seite am Deck zeigen (im Thread der Verbindung)."""
         if page == self.visible_page:
             return
+        self._send_titles()
         self._cmd(f"PAGE {page}")
         self.prev_page = self.visible_page
         self.visible_page = page
@@ -622,16 +813,40 @@ class DeckLink(threading.Thread):
 
     def _on_knob(self, line):
         """Drehknopf: ROT/ROTP +n/-n, KNOB, KNOBLONG – Belegung nach dem Programm im Vordergrund."""
-        cfg = self.manager.config.deck_copy(self.deck_id)
-        exe, p = knob.active_preset(cfg)
+        cfg = self.manager.config.deck_view(self.deck_id)
         kind, _, arg = line.partition(" ")
+        g = self.knob_grab
+        if g and time.time() < g[2]:
+            tile = self.manager.config.tile(self.deck_id, g[0], g[1])
+            tt = plugin_api.get(tile) if tile else None
+            if tt and tt.rotatable:
+                self.knob_grab = (g[0], g[1], time.time() + 8.0)
+                ctx = plugin_api.PressContext(self.deck_id, g[0], g[1], self)
+                if kind in ("ROT", "ROTP"):
+                    try:
+                        args = (tile, ctx, int(arg))
+                    except ValueError:
+                        return
+                    threading.Thread(target=tt.on_rotate, args=args, daemon=True).start()
+                else:
+                    threading.Thread(target=tt.on_knob_press, args=(tile, ctx), daemon=True).start()
+                return
+        self.knob_grab = None
+        exe, p = knob.active_preset(cfg)
         if kind in ("ROT", "ROTP"):
             try:
                 n = int(arg)
             except ValueError:
                 return
             pushed = kind == "ROTP"
-            if p["rotp" if pushed else "rot"] == "pages":
+            if p["rotp" if pushed else "rot"] == "tile":
+                ref = knob.parse_tile(p.get("tile_rot", ""))
+                tile = self.manager.config.tile(self.deck_id, *ref) if ref else None
+                tt = plugin_api.get(tile) if tile else None
+                if tt and tt.rotatable:
+                    ctx = plugin_api.PressContext(self.deck_id, ref[0], ref[1], self)
+                    threading.Thread(target=tt.on_rotate, args=(tile, ctx, n), daemon=True).start()
+            elif p["rotp" if pushed else "rot"] == "pages":
                 count = len(cfg["pages"]) if cfg else 0
                 if count > 1:
                     page = (self.visible_page + n) % count
@@ -654,6 +869,7 @@ class DeckLink(threading.Thread):
                 if tile:
                     ctx = plugin_api.PressContext(self.deck_id, ref[0], ref[1], self)
                     threading.Thread(target=self._press, args=(tile, ctx, False), daemon=True).start()
+                    self.request_osd(None, f"Kachel: {tile_label(tile)}")
             else:
                 self.knob.press(p, long)
 
@@ -686,7 +902,9 @@ class DeckLink(threading.Thread):
             self.request_live_update(0)
             # selbst geblättert: hat Vorrang bis zum nächsten Programmwechsel
             self.manual_page = self.visible_page
-            self.auto_active = False
+            if self.auto_active:
+                self.auto_active = False
+                self._send_titles()
         elif line.startswith("DEL "):
             try:
                 _, p, i = line.split()
@@ -751,7 +969,7 @@ class DeckLink(threading.Thread):
         parts = next((l.split() for l in lines if l.startswith("WIFI ")), [])
         if len(parts) >= 5 and parts[4] != "-":
             self._cmd("WIFI RESET")
-            name = (self.manager.config.deck_copy(self.deck_id) or {}).get("name", self.deck_id)
+            name = (self.manager.config.deck_view(self.deck_id) or {}).get("name", self.deck_id)
             self.manager.notify(f"{name}: WLAN-Einstellungen des Decks zurückgesetzt (anderer PC) – "
                                 "bei Bedarf unter „WLAN ...“ neu einrichten")
 
@@ -760,12 +978,17 @@ class DeckLink(threading.Thread):
             self._reset_foreign_wlan()
             self._sync(False)
             self._sync_theme()
+            self._init_page()
+            self._send_titles()
             while self.alive:
                 try:
                     job, arg = self.jobs.get_nowait()
                     if job == "sync":
                         self._sync(arg)
                         self._sync_theme()
+                        self._send_titles()
+                    elif job == "titles":
+                        self._send_titles()
                     elif job == "cal":
                         self._cmd("CAL")
                     elif job == "bri":
@@ -792,11 +1015,13 @@ class DeckLink(threading.Thread):
                 while self.backlog:
                     self._on_line(self.backlog.pop(0))
                 if self.fw >= 4 and time.time() >= self.next_ping:
-                    self.next_ping = time.time() + self.PING_INTERVAL
+                    # USB: jede Sekunde (klassischer ESP32 erkennt "kein USB" an 3 s ohne Daten, ab FW 19)
+                    self.next_ping = time.time() + (self.PING_INTERVAL if self.via_wlan else 1.0)
                     self._cmd("PING")
                 if time.time() >= self.next_live:
                     self.next_live = time.time() + self.LIVE_INTERVAL
                     self._live()
+                self._grab_osd()
                 line = self._readline(0.05)
                 if line:
                     self._on_line(line)
@@ -901,7 +1126,9 @@ class DeckManager(threading.Thread):
     def scan_once(self):
         for p in self._candidates():
             res = self._probe(p.device)
-            if res is False and p.vid != 0x303A:  # Espressif-USB ist immer ein ESP32 – weiter fragen
+            # Espressif-USB ist immer ein ESP32, und an einem Port, an dem schon ein Deck war, weiter fragen
+            # (das Deck kann beim ersten Versuch beschäftigt sein, z. B. nach einem Neustart)
+            if res is False and p.vid != 0x303A and p.hwid not in self.config.deck_ports():
                 with self.lock:
                     self.not_deck.add((p.device, p.hwid))
                 log.info("%s (%s) ist kein Deck – wird erst nach neuem Anstecken wieder gefragt",
@@ -922,6 +1149,7 @@ class DeckManager(threading.Thread):
             with self.lock:
                 self.links[deck_id] = link
                 self.busy_ports.add(p.device)
+            self.config.add_deck_port(p.hwid)
             link.start()
             self.notify(f"{cfg['name']} verbunden ({p.device})")
 

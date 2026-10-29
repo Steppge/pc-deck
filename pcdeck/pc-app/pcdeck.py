@@ -148,6 +148,16 @@ class App:
             ),
         )
 
+    @staticmethod
+    def _default_sounds():
+        """Standard-Sounds des Soundboards einmal herunterladen (falls sie im Sound-Ordner fehlen)."""
+        try:
+            import soundsearch
+            for p in soundsearch.ensure_defaults():
+                logging.info("Standard-Sound heruntergeladen: %s", p)
+        except Exception as e:  # z. B. offline – beim nächsten Start wieder versuchen
+            logging.warning("Standard-Sounds nicht ladbar: %s", e)
+
     def listen(self, sock):
         """Zweiter Start von PC-Deck meldet sich hier: Konfigurationsfenster zeigen."""
         def loop():
@@ -167,6 +177,7 @@ class App:
         threading.Thread(target=loop, daemon=True).start()
 
     def run(self):
+        threading.Thread(target=self._default_sounds, daemon=True).start()
         self.icon.run_detached()
         self.manager.start()
         self.root.after(200, self.poll)

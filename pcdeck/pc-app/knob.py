@@ -13,6 +13,7 @@ alles andere läuft hier nacheinander in einem eigenen Thread, damit die Verbind
 import logging
 import queue
 import threading
+import time
 
 import winaudio
 import winctl
@@ -24,7 +25,7 @@ log = logging.getLogger("pcdeck")
 ROT_ACTIONS = [("volume", "Lautstärke (System)"), ("app_volume", "Lautstärke des Programms"),
                ("output", "Ausgabegerät wechseln"), ("scroll", "Scrollen"), ("hscroll", "Seitlich scrollen"),
                ("zoom", "Zoomen (Strg + Mausrad)"), ("pages", "Seiten am Deck blättern"),
-               ("keys", "Tastenkürzel"), ("off", "Aus")]
+               ("keys", "Tastenkürzel"), ("tile", "Kachel einstellen (z. B. Rollladen)"), ("off", "Aus")]
 PRESS_ACTIONS = [("mute", "Ton stumm / an"), ("mic_mute", "Mikrofon stumm / an"), ("play_pause", "Play / Pause"),
                  ("next", "Nächster Titel"), ("prev", "Voriger Titel"),
                  ("screenshot", "Screenshot (Ausschnitt, Win+Umschalt+S)"), ("output", "Nächstes Ausgabegerät"),
@@ -34,7 +35,7 @@ LINK_ACTIONS = {"pages", "page1", "tile"}  # führt der DeckLink aus
 DEFAULT_PRESET = {"rot": "volume", "rotp": "output", "press": "mute", "long": "off", "step": 2, "app": "",
                   "devices": [], "devices_names": {},
                   "keys_left": "", "keys_right": "", "keysp_left": "", "keysp_right": "",
-                  "keys_press": "", "keys_long": "", "tile_press": "", "tile_long": ""}
+                  "keys_press": "", "keys_long": "", "tile_press": "", "tile_long": "", "tile_rot": ""}
 VK_PLAY_PAUSE, VK_NEXT, VK_PREV = 0xB3, 0xB0, 0xB1
 SCREENSHOT = [0x5B, 0x10, 0x53]  # Win+Umschalt+S
 MAX_REPEAT = 20  # Tastenkürzel/Mausrad je Meldung höchstens so oft (sehr schnelles Drehen)
@@ -106,7 +107,17 @@ class Worker:
     def __init__(self, osd=None):
         self.osd = osd or (lambda pct, text: None)
         self.jobs = queue.Queue()
+        self._shown = ("", 0.0)  # zuletzt angezeigte Aktion (Text, Zeit)
         threading.Thread(target=self._run, daemon=True).start()
+
+    def _show(self, text):
+        """Aktion am Deck anzeigen (nur die Funktion, ohne Programmname). Beim schnellen Drehen höchstens
+        alle 0,3 s neu schicken – die Anzeige bleibt so stehen, solange gedreht wird."""
+        now = time.monotonic()
+        if self._shown[0] == text and now - self._shown[1] < 0.3:
+            return
+        self._shown = (text, now)
+        self.osd(None, text)
 
     def _run(self):
         while True:
@@ -132,16 +143,20 @@ class Worker:
             self._do(self._output, p, 1 if n > 0 else -1)
         elif action == "scroll":
             self._do(winkeys.wheel, -reps)  # rechts drehen = nach unten
+            self._show("Scrollen ab" if n > 0 else "Scrollen auf")
         elif action == "hscroll":
             self._do(winkeys.wheel, reps, True)
+            self._show("Scrollen rechts" if n > 0 else "Scrollen links")
         elif action == "zoom":
             self._do(winkeys.wheel, reps, False, True)
+            self._show("Zoom +" if n > 0 else "Zoom -")
         elif action == "keys":
             prefix = "keysp_" if pushed else "keys_"
             seq = p[prefix + ("right" if n > 0 else "left")]
             if seq.strip():
                 for _ in range(abs(reps)):
                     self._do(winkeys.send_sequence, seq)
+                self._show(f"Tasten: {seq.strip()}")
 
     # -- Drücken (kurz oder lang)
     def press(self, p, long):
@@ -153,14 +168,17 @@ class Worker:
         elif action in ("play_pause", "next", "prev"):
             vk = {"play_pause": VK_PLAY_PAUSE, "next": VK_NEXT, "prev": VK_PREV}[action]
             self._do(winkeys.send_combo, [vk])
+            self._show({"play_pause": "Play / Pause", "next": "Nächster Titel", "prev": "Voriger Titel"}[action])
         elif action == "screenshot":
             self._do(winkeys.send_combo, SCREENSHOT)
+            self._show("Screenshot")
         elif action == "output":
             self._do(self._output, p, 1)
         elif action == "keys":
             seq = p["keys_long" if long else "keys_press"]
             if seq.strip():
                 self._do(winkeys.send_sequence, seq)
+                self._show(f"Tasten: {seq.strip()}")
 
     # -- Aktionen mit Wert-Anzeige
     def _volume(self, delta):

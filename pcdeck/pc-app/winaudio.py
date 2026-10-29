@@ -207,6 +207,20 @@ def change_volume(delta_percent):
             _set_mute(vol, False)  # lauter machen hebt die Stummschaltung auf (wie bei Windows)
 
 
+def _volume_by_id(com, device_id):
+    """Lautstärke-Schnittstelle eines bestimmten Geräts (IMMDeviceEnumerator::GetDevice)."""
+    dev = com.new()
+    _check(_method(com.enumerator(), 5, wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p))(
+        device_id, ctypes.byref(dev)), "GetDevice")
+    return _volume_of(com, dev)
+
+
+def _mic_volumes(com, all_mics, device_id):
+    if device_id:
+        return [_volume_by_id(com, device_id)]
+    return _all_capture_volumes(com) if all_mics else [_default_volume(com, CAPTURE)]
+
+
 def _all_capture_volumes(com):
     col = com.new()
     _check(_method(com.enumerator(), 3, ctypes.c_int, wt.DWORD, ctypes.POINTER(ctypes.c_void_p))(
@@ -221,19 +235,20 @@ def _all_capture_volumes(com):
     return vols
 
 
-def mic_muted(all_mics=False):
-    """True/False; bei all_mics nur True, wenn alle Mikrofone stumm sind. None = kein Mikrofon."""
+def mic_muted(all_mics=False, device_id=""):
+    """True/False; bei all_mics nur True, wenn alle Mikrofone stumm sind. None = kein Mikrofon.
+    device_id: ein bestimmtes Aufnahmegerät (z. B. das virtuelle Mikrofon von VoiceMeeter)."""
     try:
         with _Com() as com:
-            vols = _all_capture_volumes(com) if all_mics else [_default_volume(com, CAPTURE)]
+            vols = _mic_volumes(com, all_mics, device_id)
             return all(_get_mute(v) for v in vols) if vols else None
     except OSError:
         return None
 
 
-def toggle_mic(all_mics=False):
+def toggle_mic(all_mics=False, device_id=""):
     with _Com() as com:
-        vols = _all_capture_volumes(com) if all_mics else [_default_volume(com, CAPTURE)]
+        vols = _mic_volumes(com, all_mics, device_id)
         if not vols:
             return
         new = not all(_get_mute(v) for v in vols)

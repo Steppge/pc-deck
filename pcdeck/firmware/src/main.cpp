@@ -44,7 +44,7 @@
 #ifndef LOGO_TM
 #define LOGO_TM 0
 #endif
-#define FW_VERSION "16"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
+#define FW_VERSION "22"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
                         // 5 = flimmerfreies Zeichnen (Seite im PSRAM), 6 = Plus-Kachel (CLR, leere Plätze),
                         // 7 = Löschen per Sicherheitsabfrage (DEL), 8 = Design (Startbild, Seitenbild, Glas-Kacheln),
                         // 9 = ohne Verbindung zur PC-App nur das Logo, 10 = Drehgeber (ROT, KNOB, KNOBLONG),
@@ -52,7 +52,12 @@
                         // 13 = WLAN im USB-Betrieb aus, ohne USB Abfrage "WLAN einschalten?",
                         // 14 = Logo-Text fest pro Deck, Abfrage per LOGO,
                         // 15 = Seitenbild ohne PSRAM aus dem Flash, Logo im WLAN erst nach 12 s,
-                        // 16 = Firmware-Update über die Verbindung (FWINFO, FWBEGIN, FWDATA, FWEND)
+                        // 16 = Firmware-Update über die Verbindung (FWINFO, FWBEGIN, FWDATA, FWEND),
+                        // 17 = Seitenname in der Navigationsleiste (TITLE), aktuelle Seite abfragen (CURPAGE),
+                        // 18 = Firmware-Update auch über WLAN (signiert mit dem Kopplungsschlüssel),
+                        // 19 = klassischer ESP32: "kein USB" schon nach 3 s ohne App-Daten, Startbild 1,5 s,
+                        // 20/21 = Icon-Hintergrund (Schlüsselfarbe) auf Design-Kacheln wirklich durchsichtig,
+                        // 22 = Icons komprimiert (ICONZ, UPD mit Typ 2) – weniger Speicher und Übertragung
 // Deck-Typ: die PC-App spielt nur eine Firmware mit demselben Typ auf
 #ifndef DECK_TYPE
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -86,10 +91,12 @@ __attribute__((used)) static const char FW_TAG[] = "PCDECK-FW " FW_VERSION " " D
 #endif
 #define DISC_PORT 5556  // UDP: Suche der PC-App ("PCDECK?" -> "PCDECK <id> <port> <fw> <belegt>")
 #define WIFI_USB_OFF_MS 30000  // so lange darf WLAN im USB-Betrieb noch an bleiben (z. B. nach dem Einrichten)
-#define NO_USB_ASK_MS 3000     // so lange ohne USB-PC, dann die Abfrage "WLAN einschalten?"
+#define NO_USB_ASK_MS 1000     // so lange ohne USB-PC, dann die Abfrage "WLAN einschalten?"
+#define USB_DATA_MS 3000       // klassischer ESP32: so lange ohne Daten der App (PING jede Sekunde) = kein USB
+#define BOOT_USB_WAIT_MS 4000  // nach dem Start so lange auf die App warten, bevor "kein USB" gilt
 #define PC_TIMEOUT_MS 5000    // so lange ohne Nachricht der PC-App -> nur noch das Logo
 #define NET_TIMEOUT_MS 12000  // dasselbe im WLAN (Funkaussetzer überbrücken)
-#define BOOT_LOGO_MS 3000   // so lange bleibt das Startbild stehen (Berühren = Touch kalibrieren)
+#define BOOT_LOGO_MS 1500   // so lange bleibt das Startbild stehen (Berühren = Touch kalibrieren)
 #define LONG_MS 600     // ab so langem Drücken gilt ein Tipper als "lang" (Rahmen gelb, beim Loslassen LONG)
 #define DELETE_MS 1500  // ab so langem Drücken: Sicherheitsabfrage "Kachel loeschen?" (Rahmen rot)
 #define CONFIRM_TIMEOUT_MS 10000  // Abfrage ohne Antwort -> abbrechen
@@ -157,6 +164,7 @@ static std::vector<Tile> tiles;
 static int gCols = 4, gRows = 3, gPages = 0;
 static String gHash = "none";
 static int curPage = 0;
+static String pageTitle[MAX_PAGES];  // Name je Seite (nur RAM, von der PC-App; leer = "Seite x / y")
 static uint16_t iconBuf[ICON_SZ * ICON_SZ];
 static String deckId;
 static uint32_t lastPcContact = 0;
@@ -169,7 +177,9 @@ struct Live {
   bool used = false;
   bool icon = false;
   String label;
-  uint16_t* buf = nullptr;  // ICON_BYTES, erst bei Bedarf angelegt
+  uint8_t* buf = nullptr;  // Icon-Daten: roh (len == ICON_BYTES) oder komprimiert (ab FW 22)
+  uint16_t len = 0;
+  uint16_t cap = 0;        // angelegte Größe von buf
 };
 static Live live[MAX_COLS * MAX_ROWS];
 static int downTile = -1;   // gerade gedrückte Kachel (für Rahmen beim Neuzeichnen)
@@ -192,6 +202,57 @@ static void clearLive() {
 
 // ---------------------------------------------------------------- Hilfen
 static String iconPath(int p, int i) { return "/i" + String(p) + "_" + String(i) + ".bin"; }
+
+// Icons komprimiert (ab FW 22, Lauflängen): Steuerbyte c; c & 0x80: (c & 0x7F) + 1 mal das folgende Pixel,
+// sonst c + 1 Pixel wörtlich (Pixel = RGB565 little endian). Eine Datei mit genau ICON_BYTES ist roh.
+static uint8_t zBuf[ICON_BYTES];  // komprimierte Daten beim Lesen/Empfangen
+
+static bool unpackIcon(const uint8_t* src, size_t n, uint16_t* dst) {
+  size_t o = 0, i = 0;
+  const size_t total = ICON_SZ * ICON_SZ;
+  while (i < n && o < total) {
+    uint8_t c = src[i++];
+    size_t cnt = (c & 0x7F) + 1;
+    if (o + cnt > total) return false;
+    if (c & 0x80) {
+      if (i + 2 > n) return false;
+      uint16_t v = src[i] | (src[i + 1] << 8);
+      i += 2;
+      while (cnt--) dst[o++] = v;
+    } else {
+      if (i + 2 * cnt > n) return false;
+      while (cnt--) {
+        dst[o++] = src[i] | (src[i + 1] << 8);
+        i += 2;
+      }
+    }
+  }
+  return o == total && i == n;
+}
+
+// Icon (roh oder komprimiert) nach dst (ICON_SZ*ICON_SZ Pixel) bringen
+static bool iconFrom(const uint8_t* data, size_t n, uint16_t* dst) {
+  if (n == ICON_BYTES) {
+    if ((const void*)data != (const void*)dst) memcpy(dst, data, ICON_BYTES);
+    return true;
+  }
+  return n < ICON_BYTES && unpackIcon(data, n, dst);
+}
+
+// gespeichertes Icon einer Kachel nach iconBuf laden
+static bool loadIcon(int p, int i) {
+  File f = LittleFS.open(iconPath(p, i), "r");
+  if (!f) return false;
+  size_t n = f.size();
+  bool ok = false;
+  if (n == ICON_BYTES) {
+    ok = f.read((uint8_t*)iconBuf, ICON_BYTES) == ICON_BYTES;
+  } else if (n > 0 && n < ICON_BYTES) {
+    ok = f.read(zBuf, n) == n && unpackIcon(zBuf, n, iconBuf);
+  }
+  f.close();
+  return ok;
+}
 
 static Tile* findTile(int p, int i) {
   for (auto& t : tiles)
@@ -342,18 +403,27 @@ static void drawTileTo(lgfx::LovyanGFX& g, LGFX_Sprite* spr, int ox, int oy, int
 
     const uint16_t* img = nullptr;
     if (l.used) {
-      if (l.icon && l.buf) img = l.buf;
+      if (l.icon && l.buf && iconFrom(l.buf, l.len, iconBuf)) img = iconBuf;
     } else if (t->icon) {
-      File f = LittleFS.open(iconPath(curPage, i), "r");
-      if (f && f.size() == ICON_BYTES && f.read((uint8_t*)iconBuf, ICON_BYTES) == ICON_BYTES) img = iconBuf;
-      if (f) f.close();
+      if (loadIcon(curPage, i)) img = iconBuf;
     }
     if (img) {
       int iy = haveLabel ? y + (h - ICON_SZ - 18) / 2 : y + (h - ICON_SZ) / 2;
-      if (theme.on)  // Icon-Hintergrund (Schlüsselfarbe) durchsichtig
-        g.pushImage(x + (w - ICON_SZ) / 2, iy, ICON_SZ, ICON_SZ, (const lgfx::rgb565_t*)img, (uint32_t)KEY565);
-      else
-        g.pushImage(x + (w - ICON_SZ) / 2, iy, ICON_SZ, ICON_SZ, (const lgfx::rgb565_t*)img);
+      int ix = x + (w - ICON_SZ) / 2;
+      if (theme.on && spr) {
+        // Icon-Hintergrund (Schlüsselfarbe) durchsichtig: Pixel selbst in den Kachel-Puffer schreiben und die
+        // Schlüsselfarbe auslassen (die Transparenz von pushImage griff mit unseren Little-Endian-Daten nicht)
+        for (int r = 0; r < ICON_SZ; r++) {
+          for (int c = 0; c < ICON_SZ; c++) {
+            uint16_t v = img[r * ICON_SZ + c];
+            if (v == KEY565) continue;
+            uint16_t* p = spritePx(*spr, 0, 0, ix + c, iy + r);  // x/y sind hier schon relativ zum Puffer
+            if (p) *p = swap16(v);
+          }
+        }
+      } else {
+        g.pushImage(ix, iy, ICON_SZ, ICON_SZ, (const lgfx::rgb565_t*)img);
+      }
       drewIcon = true;
       if (haveLabel) {
         g.setTextDatum(top_center);
@@ -455,7 +525,9 @@ static void drawNavTo(lgfx::LovyanGFX& g, LGFX_Sprite* spr) {
   g.drawString("<", 49, y0 + NAV_H / 2);
   g.drawString(">", SCREEN_W - 49, y0 + NAV_H / 2);
   g.setTextColor(fx ? COL_TEXT : COL_DIM);
-  g.drawString("Seite " + String(curPage + 1) + " / " + String(gPages), SCREEN_W / 2, y0 + NAV_H / 2);
+  String nav = pageTitle[curPage].length() ? pageTitle[curPage] + "  " + String(curPage + 1) + "/" + String(gPages)
+                                            : "Seite " + String(curPage + 1) + " / " + String(gPages);
+  g.drawString(nav, SCREEN_W / 2, y0 + NAV_H / 2);
 }
 
 // Fertiges Startbild der PC-App aus dem Flash anzeigen (false = keins vorhanden)
@@ -727,8 +799,11 @@ static bool loadCalibration() {
 //   TDIAG                          -> Wartung: Touch-Rohwerte (TRAW ...) und MISO-Pegel (TMISO ...)
 //   LOGO                           -> LOGO <widmung-hex> <name-hex> <tm 0/1> (ab FW 14, fürs Startbild der App)
 //   FWINFO                         -> FWINFO <fw> <typ> <platz> (ab FW 16; platz = max. Größe der .bin)
-//   FWBEGIN <bytes> <md5>, FWDATA <n> + Daten (<= 4096), FWEND   (nur USB) Firmware aufspielen, Neustart
+//   FWBEGIN <bytes> <md5> [<sig>], FWDATA <n> + Daten (<= 4096), FWEND   Firmware aufspielen, Neustart
+//                                  über WLAN (ab FW 18) nur mit sig = HMAC-SHA256(Schlüssel, "F"+md5+bytes)
 //   FWABORT                        Firmware-Übertragung abbrechen
+//   TITLE <seite> <name-hex|->     Name der Seite in der Navigationsleiste (ab FW 17, nur RAM; - = Nummer)
+//   CURPAGE                        -> CURPAGE <seite> (ab FW 17; nach einem Neustart der App)
 // WLAN (ab FW 12; Texte als Hex, weil Namen/Passwörter Leerzeichen enthalten können):
 //   Anmeldung über TCP (gegenseitig, der Schlüssel aus der Kopplung geht nie übers Netz):
 //     PC: AUTH1 <nonce_pc>  -> Deck: CHAL <nonce_deck> <HMAC-SHA256(schlüssel, "D" + nonce_pc)>
@@ -827,6 +902,9 @@ static bool sameText(const String& a, const String& b) {
 static bool wifiActive = false;
 static uint32_t wifiOnAt = 0;
 static bool wifiAsk = false;      // Abfrage "WLAN einschalten?" wird gezeigt
+#define NET_RESTART_MAGIC 0x57494649u
+RTC_NOINIT_ATTR static uint32_t netRestart;  // überlebt ESP.restart(): Update kam über WLAN
+static bool autoWifiOnce = false;  // nach so einem Neustart: ohne USB WLAN gleich wieder an
 static bool wifiAsked = false;    // seit dem Trennen vom USB schon gefragt
 static uint32_t usbSince = 0, noUsbSince = 0;
 static bool usbWas = true;
@@ -925,6 +1003,7 @@ static void handleWifi(char* arg) {
 
 // ---------------------------------------------------------------- Firmware-Update
 static size_t fwTotal = 0, fwDone = 0;
+static bool fwViaNet = false;  // Update kam über WLAN
 static int fwShown = -1;
 
 static void drawFwProgress(const char* text) {
@@ -975,6 +1054,7 @@ static void handleLine(char* line) {
     pPages = constrain(pPages, 0, MAX_PAGES);
     pHash = hash;
     pending.clear();
+    for (auto& t : pageTitle) t = "";
     clearStore();
     clearLive();
     drawWaiting("Empfange Konfiguration ...");
@@ -1008,6 +1088,29 @@ static void handleLine(char* line) {
     size_t w = f.write((uint8_t*)iconBuf, ICON_BYTES);
     f.close();
     io->println(w == ICON_BYTES ? "ACK" : "ERR full");
+  } else if (strncmp(line, "ICONZ ", 6) == 0) {
+    // ICONZ <seite> <platz> <bytes> + komprimierte Daten (ab FW 22)
+    int p, i, n;
+    if (sscanf(line + 6, "%d %d %d", &p, &i, &n) != 3 || n <= 0 || n >= ICON_BYTES) {
+      io->println("ERR iconz");
+      return;
+    }
+    if (readExact(zBuf, n) != (size_t)n) {
+      io->println("ERR short");
+      return;
+    }
+    if (!unpackIcon(zBuf, n, iconBuf)) {  // prüfen, bevor es gespeichert wird
+      io->println("ERR iconz");
+      return;
+    }
+    File f = LittleFS.open(iconPath(p, i), "w");
+    if (!f) {
+      io->println("ERR fs");
+      return;
+    }
+    size_t w = f.write(zBuf, n);
+    f.close();
+    io->println(w == (size_t)n ? "ACK" : "ERR full");
   } else if (strcmp(line, "END") == 0) {
     tiles = pending;
     pending.clear();
@@ -1020,18 +1123,31 @@ static void handleLine(char* line) {
     drawPage();
     io->println("ACK");
   } else if (strncmp(line, "UPD ", 4) == 0) {
-    // Live-Kachel: nur RAM, nur sichtbare Seite. Icon-Daten folgen wie bei ICON.
-    int p, i, ic, off = 0;
+    // Live-Kachel: nur RAM, nur sichtbare Seite. UPD <seite> <platz> <icon> [<bytes>] <text>
+    // icon: 0 = keins, 1 = roh (ICON_BYTES folgen), 2 = komprimiert (ab FW 22, <bytes> folgen)
+    int p, i, ic, off = 0, n = ICON_BYTES;
     if (sscanf(line + 4, "%d %d %d %n", &p, &i, &ic, &off) < 3 || i < 0 || i >= MAX_COLS * MAX_ROWS) {
       io->println("ERR upd");
       return;
     }
+    if (ic == 2) {
+      int off2 = 0;
+      if (sscanf(line + 4 + off, "%d %n", &n, &off2) < 1 || n <= 0 || n >= ICON_BYTES) {
+        io->println("ERR upd");
+        return;
+      }
+      off += off2;
+    }
     Live& l = live[i];
     bool visible = (p == curPage && gPages > 0);
     if (ic) {
-      if (!l.buf) l.buf = (uint16_t*)malloc(ICON_BYTES);
-      uint8_t* dst = l.buf ? (uint8_t*)l.buf : (uint8_t*)iconBuf;  // ohne Speicher: Daten trotzdem abholen
-      if (readExact(dst, ICON_BYTES) != ICON_BYTES) {
+      if (l.cap < n) {  // Puffer passend anlegen (komprimiert meist nur 1-3 KB statt 8 KB)
+        free(l.buf);
+        l.buf = (uint8_t*)malloc(n);
+        l.cap = l.buf ? n : 0;
+      }
+      uint8_t* dst = l.buf ? l.buf : zBuf;  // ohne Speicher: Daten trotzdem abholen
+      if (readExact(dst, n) != (size_t)n) {
         io->println("ERR short");
         return;
       }
@@ -1039,6 +1155,7 @@ static void handleLine(char* line) {
         io->println("ERR mem");
         return;
       }
+      l.len = n;
     }
     if (visible) {
       l.used = true;
@@ -1062,6 +1179,23 @@ static void handleLine(char* line) {
       tft.startWrite();
       drawTile(i, i == downTile, longSent);
       tft.endWrite();
+    }
+    io->println("ACK");
+  } else if (strcmp(line, "CURPAGE") == 0) {
+    io->printf("CURPAGE %d\n", curPage);
+    io->println("ACK");
+  } else if (strncmp(line, "TITLE ", 6) == 0) {
+    int p = -1, off = 0;
+    if (sscanf(line + 6, "%d %n", &p, &off) < 1 || p < 0 || p >= MAX_PAGES || off == 0) {
+      io->println("ERR title");
+      return;
+    }
+    String t = strcmp(line + 6 + off, "-") == 0 ? String("") : fromHex(line + 6 + off);
+    t.trim();
+    if (t.length() > 28) t = t.substring(0, 28);
+    if (t != pageTitle[p]) {
+      pageTitle[p] = t;
+      if (p == curPage && pcOk && gPages > 1) drawPage();
     }
     io->println("ACK");
   } else if (strncmp(line, "PAGE ", 5) == 0) {
@@ -1193,15 +1327,18 @@ static void handleLine(char* line) {
     io->println("ACK");
   } else if (strncmp(line, "FWBEGIN ", 8) == 0) {
     unsigned n = 0;
-    char md5[40] = {0};
-    if (fromNet) {
-      io->println("ERR usb");  // Firmware nur per USB
-      return;
-    }
-    if (sscanf(line + 8, "%u %39s", &n, md5) != 2 || strlen(md5) != 32) {
+    char md5[40] = {0}, sig[80] = {0};
+    if (sscanf(line + 8, "%u %39s %79s", &n, md5, sig) < 2 || strlen(md5) != 32) {
       io->println("ERR fwbegin");
       return;
     }
+    // über WLAN nur mit Unterschrift der gekoppelten App: Die MD5 wird am Ende geprüft, die Unterschrift
+    // über MD5 und Größe beweist, dass die Datei von der App mit dem Kopplungsschlüssel kommt
+    if (fromNet && !(netKey.length() && sameText(String(sig), hmacHex(netKey, "F" + String(md5) + String(n))))) {
+      io->println("ERR fwsig");
+      return;
+    }
+    fwViaNet = fromNet;
     if (Update.isRunning()) Update.abort();
     if (!Update.begin(n, U_FLASH)) {
       io->printf("ERR fw %s\n", Update.errorString());
@@ -1243,6 +1380,7 @@ static void handleLine(char* line) {
     io->println("ACK");
     io->flush();
     delay(500);
+    if (fwViaNet) netRestart = NET_RESTART_MAGIC;  // nach dem Neustart WLAN ohne Abfrage wieder an
     ESP.restart();
   } else if (strcmp(line, "FWABORT") == 0) {
     if (Update.isRunning()) Update.abort();
@@ -1366,12 +1504,16 @@ static void pollNet() {
 
 // ---------------------------------------------------------------- WLAN je nach USB
 // PC am USB? S3 mit nativem USB: der Host sendet USB-Rahmen (auch ohne laufende App).
-// Klassischer ESP32 (USB-Seriell-Wandler): nur erkennbar an Daten der PC-App.
+// Klassischer ESP32 (USB-Seriell-Wandler): erkennbar nur an Daten der PC-App – sie schickt per USB jede
+// Sekunde ein Lebenszeichen. Nach dem Start bekommt die App BOOT_USB_WAIT_MS Zeit, sich zu melden.
+static uint32_t loopStartMs = 0;
+
 static bool usbHost() {
 #if ARDUINO_USB_CDC_ON_BOOT && defined(CONFIG_IDF_TARGET_ESP32S3)
   return HWCDC::isPlugged();
 #else
-  return lastSerialRx && millis() - lastSerialRx < 10000;
+  if (!lastSerialRx) return millis() - loopStartMs < BOOT_USB_WAIT_MS;
+  return millis() - lastSerialRx < USB_DATA_MS;
 #endif
 }
 
@@ -1440,6 +1582,7 @@ static void pollWifiPower() {
   }
   if (usb) {
     wifiAsked = false;
+    autoWifiOnce = false;
     if (wifiAsk) {  // wieder am PC: Abfrage weg
       wifiAsk = false;
       drawPage();
@@ -1450,6 +1593,10 @@ static void pollWifiPower() {
       wifiRadio(false);
       if (!pcOk) drawPage();
     }
+  } else if (wifiEn && wifiSsid.length() && !wifiActive && !wifiAsked && autoWifiOnce) {
+    wifiAsked = true;  // Neustart nach Update über WLAN: ohne Abfrage wieder verbinden
+    autoWifiOnce = false;
+    wifiRadio(true);
   } else if (wifiEn && wifiSsid.length() && !wifiActive && !wifiAsked && now - noUsbSince > NO_USB_ASK_MS) {
     wifiAsked = true;  // pro Trennen einmal fragen
     if (!pcOk) {
@@ -1687,6 +1834,8 @@ static void pollEncoder() {}
 
 // ---------------------------------------------------------------- Setup/Loop
 void setup() {
+  if (netRestart == NET_RESTART_MAGIC) autoWifiOnce = true;
+  netRestart = 0;
   // Puffer muss ein ganzes Icon (8 KB) + Befehle fassen. Gilt auch für native USB:
   // HWCDC hat ab Werk nur 256 Byte und verwirft bei vollem Puffer Daten.
   Serial.setRxBufferSize(16384);
@@ -1757,7 +1906,9 @@ void setup() {
 
 // Statuspunkt aktualisieren: PC-App gilt als getrennt, wenn sie sich PC_TIMEOUT_MS nicht meldet
 static void pollPcStatus() {
-  if (!pcOk || millis() - lastPcContact < (viaNet ? NET_TIMEOUT_MS : PC_TIMEOUT_MS)) return;
+  if (!pcOk) return;
+  bool usbGone = !viaNet && !usbHost();  // per USB verbunden und USB weg: App ist sicher weg
+  if (!usbGone && millis() - lastPcContact < (viaNet ? NET_TIMEOUT_MS : PC_TIMEOUT_MS)) return;
   pcOk = false;  // App meldet sich nicht mehr (Herunterfahren, Abmelden, Standby, beendet): Logo
   confirmActive = false;
   downTile = -1;
@@ -1772,6 +1923,7 @@ static void pollOsd() {
 }
 
 void loop() {
+  if (!loopStartMs) loopStartMs = millis() ? millis() : 1;
   pollSerial();
   pollNet();
   pollWifiPower();

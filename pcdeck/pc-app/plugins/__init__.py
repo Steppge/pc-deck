@@ -9,3 +9,5 @@ from . import media  # noqa: F401
 from . import audio  # noqa: F401
 from . import keys  # noqa: F401
 from . import obs  # noqa: F401
+from . import bosch  # noqa: F401
+from . import sound  # noqa: F401

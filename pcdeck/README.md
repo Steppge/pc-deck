@@ -1,4 +1,4 @@
-# PC-Deck – Touch-Programmstarter mit ESP32 (Stand 24.10.2026, App 1.5.0, Firmware 16)
+# PC-Deck – Touch-Programmstarter mit ESP32 (Stand 25.10.2026, App 1.6.0, Firmware 16)
 
 Ein selbstgebautes „Stream Deck“: Auf einem 3,5"-Touchdisplay erscheinen Kacheln mit den
 **echten Windows-Icons** deiner Programme und Ordner, dazu Live-Kacheln (Uhr, CPU, Lautstärke,
@@ -37,7 +37,7 @@ Sie bleiben bei Updates erhalten; beim Deinstallieren wirst du gefragt, ob sie g
   Eine Verknüpfung auf einen Ordner verhält sich wie der Ordner selbst (minimieren, schließen).
 - **Kachel anklicken:** Typ wählen – Programm/Ordner/Datei/Webadresse, Uhr, CPU, RAM, Lautstärke,
   Stoppuhr, Timer, Medien, „Jetzt läuft“, Ausgabegerät, Audio-Profil, Mikrofon stumm,
-  Tastenkürzel, Textbaustein, Seite wechseln, OBS.
+  Tastenkürzel, Textbaustein, Seite wechseln, OBS, Bosch Smart Home (Rollladen, Licht).
 - **Rechtsklick:** kopieren, ausschneiden, einfügen, leeren.
 - **Spalten/Zeilen** (bis 5 × 3), **Seiten** (bis 8), **Helligkeit**.
 - **Automatik:** pro Seite Programme eintragen – kommt eines nach vorne, springt das Deck auf diese Seite.
@@ -45,6 +45,20 @@ Sie bleiben bei Updates erhalten; beim Deinstallieren wirst du gefragt, ob sie g
   antippen speichert es als Kachel.
 - **„Speichern & ans Deck senden“** überträgt die Änderungen.
 - Maus kurz über eine Schaltfläche halten → Erklärung. **„?“** öffnet eine kurze Anleitung.
+
+### Bosch Smart Home (Rollladen, Licht)
+
+Steuert Rollläden und Lichtsteuerungen über den **Bosch Smart Home Controller** (I oder II) direkt im
+Heimnetz – ohne Cloud, die Bosch-App funktioniert weiter. Geht, solange PC-Deck auf dem PC läuft.
+1. Hauptfenster → **„Smart Home …“** → **„Suchen“** findet den Controller (oder IP eintragen).
+2. **Systempasswort** des Controllers eintippen (wird nicht gespeichert).
+3. **Taste am Controller drücken, bis die LEDs blinken**, dann sofort **„Koppeln“**. Im Controller
+   erscheint danach „OSS PC-Deck“; das Zertifikat liegt verschlüsselt in `C:\Users\<Name>\PCDeck\bosch.json`.
+4. Kachel-Typ **„Bosch Smart Home (Rollladen, Licht)“**, Gerät wählen:
+   - **Rollladen:** kurz = auf bzw. zu (fährt er gerade: anhalten), lang = anhalten; die Kachel zeigt
+     Lamellen und Prozent.
+   - **Licht:** kurz = an/aus; die Glühbirne leuchtet gelb, wenn es an ist.
+5. Drehknopf: **„Kachel einstellen“** → Rollladen in 10-%-Schritten fahren (Licht: rechts an, links aus).
 
 **Store-Apps** (Rechner, Fotos …): Win+R → `shell:AppsFolder`, App auf den Desktop ziehen
 (erzeugt eine Verknüpfung), diese auf eine Kachel ziehen.
@@ -72,7 +86,9 @@ kurz und lang Drücken tun:
   - Discord: drehen = Discord-Lautstärke, drücken = Mikrofon stumm
   - Edge: drehen = scrollen, gedrückt drehen = zoomen, drücken = Screenshot
 - Drehen: Lautstärke (System oder nur ein Programm), Ausgabegerät, Scrollen, seitlich scrollen,
-  Zoomen, Seiten blättern, Tastenkürzel.
+  Zoomen, Seiten blättern, Tastenkürzel, Kachel einstellen (z. B. Bosch-Rollladen).
+- Scrollen und Zoomen wirken im Programm im Vordergrund, auch wenn die Maus woanders steht.
+- Presets gelten auch für Hilfsprozesse eines Programms (z. B. Steam-Fenster von `steamwebhelper.exe`).
 - Drücken: Ton stumm, Mikrofon stumm, Play/Pause, nächster/voriger Titel, Screenshot,
   nächstes Ausgabegerät, Kachel auslösen, Seite 1, Tastenkürzel.
 - Ab Werk: drehen = Lautstärke, gedrückt drehen = Ausgabegerät, drücken = stumm.

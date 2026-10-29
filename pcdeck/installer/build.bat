@@ -26,7 +26,8 @@ popd
 echo [1/2] PC-Deck.exe bauen ...
 taskkill /F /IM PC-Deck.exe >nul 2>&1
 pushd "%HERE%..\pc-app" || goto :fehler
-".venv\Scripts\pyinstaller.exe" --noconfirm --noconsole --onefile --name PC-Deck --collect-all tkinterdnd2 pcdeck.py || (popd & goto :fehler)
+rem Ordner-Version (--onedir): startet schneller als eine Einzel-.exe, entpackt nichts nach %TEMP%
+".venv\Scripts\pyinstaller.exe" --noconfirm --noconsole --onedir --name PC-Deck --collect-all tkinterdnd2 pcdeck.py || (popd & goto :fehler)
 popd
 
 echo [2/2] Installer bauen ...

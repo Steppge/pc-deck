@@ -42,7 +42,8 @@ Name: "desktopicon"; Description: "Verknüpfung auf dem Desktop anlegen"; GroupD
 Name: "autostart"; Description: "Mit Windows starten"; GroupDescription: "Zusätzlich:"; Flags: unchecked
 
 [Files]
-Source: "..\pc-app\dist\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+; Ordner-Version der App: PC-Deck.exe + _internal\ (Python, Bibliotheken)
+Source: "..\pc-app\dist\PC-Deck\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Firmware für das Update aus der App (Fenster „Firmware ...“)
 Source: "..\firmware\.pio\build\deck_s3_ts35\firmware.bin"; DestDir: "{app}\firmware"; DestName: "pcdeck_s3_ts35.bin"; Flags: ignoreversion
 Source: "..\firmware\.pio\build\deck_esp32_tft35\firmware.bin"; DestDir: "{app}\firmware"; DestName: "pcdeck_esp32_tft35.bin"; Flags: ignoreversion

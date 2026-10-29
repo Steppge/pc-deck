@@ -6,10 +6,12 @@ import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import ImageTk
 
+import boschshc
 import fwfile
 import iconextract
 import knob
@@ -68,10 +70,7 @@ class TileDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
         self.data = dict(tile or {})          # Werte aller Typen (bleiben beim Typwechsel erhalten)
-        self.types = plugin_api.all_types()
         self.type = plugin_api.get(self.data)
-        if self.type not in self.types:       # unbekannter Typ: trotzdem anzeigen
-            self.types.append(self.type)
         self.vars = {}
 
         self.v_label = tk.StringVar(value=self.data.get("label", ""))
@@ -84,8 +83,16 @@ class TileDialog(tk.Toplevel):
         top = ttk.Frame(f)
         top.grid(row=0, column=0, columnspan=4, sticky="we")
         ttk.Label(top, text="Typ:").pack(side="left")
-        self.type_box = ttk.Combobox(top, state="readonly", width=40, values=[t.name for t in self.types])
-        self.type_box.current(self.types.index(self.type))
+        # nach Gruppen: graue Überschrift "── Audio ──", darunter eingerückt die Typen (Überschrift = None)
+        self.entries = []
+        for group, types in plugin_api.grouped_types():
+            self.entries.append((None, f"──  {group}  ──"))
+            self.entries += [(t, f"      {t.name}") for t in types]
+        if self.type not in [t for t, _ in self.entries]:  # unbekannter Typ: trotzdem anzeigen
+            self.entries.append((self.type, f"      {self.type.name}"))
+        self.type_box = ttk.Combobox(top, state="readonly", width=44, height=24,
+                                     values=[label for _, label in self.entries])
+        self.type_box.current([t for t, _ in self.entries].index(self.type))
         self.type_box.pack(side="left", padx=6)
         self.type_box.bind("<<ComboboxSelected>>", self.on_type_changed)
 
@@ -158,6 +165,29 @@ class TileDialog(tk.Toplevel):
         self._dependents = []
         row = 0
         for fld in self.type.fields:
+            if fld.kind == "info":  # nur Hinweistext (Text/Link dürfen Funktionen sein), wird nicht gespeichert
+                text = fld.label() if callable(fld.label) else fld.label
+                url = fld.default() if callable(fld.default) else fld.default
+                ttk.Label(self.fields_frame, text=text, foreground=DIM, wraplength=460, justify="left").grid(
+                    row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                row += 1
+                if url:
+                    ttk.Button(self.fields_frame, text="Download-Seite öffnen",
+                               command=lambda u=url: webbrowser.open(u)).grid(row=row, column=0, sticky="w",
+                                                                              pady=(2, 0))
+                    row += 1
+                continue
+            if fld.kind == "tool":  # Schaltfläche -> Funktion des Plugins mit diesem Dialog (nicht gespeichert)
+                ttk.Button(self.fields_frame, text=fld.label, command=lambda f=fld: f.default(self)).grid(
+                    row=row, column=0, sticky="w", pady=(6, 0))
+                row += 1
+                continue
+            if fld.kind == "links":  # Schaltfläche -> Fenster mit Links (wird nicht gespeichert)
+                ttk.Button(self.fields_frame, text=fld.label,
+                           command=lambda f=fld: LinksDialog(self, f.label.rstrip(" ."), f.default)).grid(
+                    row=row, column=0, sticky="w", pady=(6, 0))
+                row += 1
+                continue
             val = self.data.get(fld.key, fld.default)
             if fld.kind == "bool":
                 var = tk.BooleanVar(value=bool(val))
@@ -237,8 +267,12 @@ class TileDialog(tk.Toplevel):
             w.configure(state="normal" if on else "disabled")
 
     def on_type_changed(self, _e=None):
+        i = self.type_box.current()
+        if self.entries[i][0] is None:  # Überschrift angeklickt -> erster Typ der Gruppe
+            i += 1
+            self.type_box.current(i)
         self._store_fields()
-        self.type = self.types[self.type_box.current()]
+        self.type = self.entries[i][0]
         self._build_fields()
         self._update_preview()
 
@@ -247,6 +281,8 @@ class TileDialog(tk.Toplevel):
         if self.type.id != plugin_api.DEFAULT_TYPE:
             t["type"] = self.type.id
         for fld in self.type.fields:
+            if fld.kind in ("info", "links", "tool"):
+                continue
             var = self.vars[fld.key]
             if fld.kind == "bool":
                 if var.get():
@@ -341,6 +377,246 @@ class TileDialog(tk.Toplevel):
         else:
             self.result = "clear"
         self.destroy()
+
+
+class SoundSearchDialog(tk.Toplevel):
+    """Sounds von myinstants suchen, probehören und nach PCDeck\\Sounds herunterladen.
+    on_pick(pfad, name): "In Kachel übernehmen" (aus dem Kachel-Dialog)."""
+
+    def __init__(self, parent, on_pick=None, on_download=None):
+        import soundsearch
+        super().__init__(parent)
+        self.ss = soundsearch
+        self.title("Sounds suchen (myinstants.com)")
+        self.transient(parent)
+        self.on_pick = on_pick
+        self.on_download = on_download  # (pfad, name) nach jedem Herunterladen, z. B. Soundboard anhaken
+        self.results = queue.Queue()
+        self.items = {}     # Zeilen-ID -> (name, mp3_url)
+        self.bytes = {}     # mp3_url -> Bytes (schon geladen)
+        self.list_args = ("popular", "", 1)
+        self.busy = 0
+
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        self.v_query = tk.StringVar()
+        e = ttk.Entry(top, textvariable=self.v_query, width=30)
+        e.pack(side="left")
+        e.bind("<Return>", lambda ev: self.search())
+        ttk.Button(top, text="Suchen", command=self.search).pack(side="left", padx=(4, 12))
+        ttk.Label(top, text="Kategorie:").pack(side="left")
+        self.cats = [("★ Beliebt in Deutschland", "popular", ""), ("Trend", "trending", "")] + \
+            [(n, "category", s) for n, s in sorted(((n, s) for s, n in soundsearch.CATEGORIES_DE.items()),
+                                                   key=lambda x: x[0].lower())]
+        self.v_cat = tk.StringVar(value=self.cats[0][0])
+        self.cat_box = ttk.Combobox(top, textvariable=self.v_cat, state="readonly", width=24,
+                                    values=[c[0] for c in self.cats])
+        self.cat_box.pack(side="left", padx=4)
+        self.cat_box.bind("<<ComboboxSelected>>", lambda ev: self._on_cat())
+        self.cat_box.bind("<MouseWheel>", lambda ev: "break")  # Mausrad soll nicht versehentlich wechseln
+
+        mid = ttk.Frame(f)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=("ok",), height=16, selectmode="browse")
+        self.tree.heading("#0", text="Sound")
+        self.tree.heading("ok", text="geladen")
+        self.tree.column("#0", width=380)
+        self.tree.column("ok", width=70, anchor="center")
+        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.tree.bind("<Double-1>", lambda ev: self.listen())
+
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(8, 0))
+        ttk.Button(b, text="▶ Anhören", command=self.listen).pack(side="left")
+        ttk.Button(b, text="■ Stopp", command=self.stop).pack(side="left", padx=4)
+        ttk.Button(b, text="⬇ Herunterladen", command=self.download).pack(side="left", padx=(12, 4))
+        if on_pick:
+            ttk.Button(b, text="In Kachel übernehmen", command=lambda: self.download(pick=True)).pack(side="left")
+        ttk.Button(b, text="Mehr laden", command=self.more).pack(side="left", padx=(12, 0))
+        b2 = ttk.Frame(f)
+        b2.pack(fill="x", pady=(6, 0))
+        ttk.Button(b2, text="Sound-Ordner öffnen", command=self.open_folder).pack(side="left")
+        ttk.Button(b2, text="Schließen", command=self.close).pack(side="right")
+        self.status = ttk.Label(f, text="", foreground=DIM)
+        self.status.pack(fill="x", pady=(6, 0))
+        ttk.Label(f, foreground=DIM, wraplength=520, justify="left",
+                  text=f"Gespeichert wird in {soundsearch.SOUND_DIR}. Rechte an Meme-Sounds aus Filmen, Spielen "
+                       "und Serien sind meist ungeklärt – für privat ok, nicht für Streams/Videos.").pack(fill="x")
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda ev: self.close())
+        TileDialog._place_over(self, parent)
+        self.after(100, self._poll)
+        self.load("popular")
+        self._work(soundsearch.fetch_categories, self._on_categories, "Lade Liste ...")
+        e.focus_set()
+        self.grab_set()  # der aufrufende Dialog hält die Eingaben fest – hier übernehmen (beim Schließen zurück)
+
+    def _on_categories(self, ok, cats):
+        if ok and cats:  # live gelesene Kategorien (neue erscheinen automatisch)
+            self.cats = self.cats[:2] + [(n, "category", s) for n, s in cats]
+            self.cat_box.configure(values=[c[0] for c in self.cats])
+
+    def _on_cat(self):
+        name = self.v_cat.get()
+        _, kind, slug = next(c for c in self.cats if c[0] == name)
+        self.load(kind, slug)
+
+    # ---------------------------------------------------------- Hintergrund
+    def _work(self, fn, done, text):
+        self.busy += 1
+        self.status.configure(text=text)
+
+        def run():
+            try:
+                res = (True, fn())
+            except Exception as ex:  # Netzwerk, Datei – Text für den Nutzer
+                res = (False, str(ex))
+            self.results.put((done, res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                done, (ok, val) = self.results.get_nowait()
+                self.busy -= 1
+                done(ok, val)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    # ---------------------------------------------------------- Listen
+    def search(self):
+        q = self.v_query.get().strip()
+        if q:
+            self.load("search", q)
+
+    def load(self, kind, query="", page=1):
+        self.list_args = (kind, query, page)
+        self._work(lambda: self.ss.fetch_list(kind, query, page), lambda ok, v: self._on_list(ok, v, page > 1),
+                   "Lade Liste ...")
+
+    def more(self):
+        kind, query, page = self.list_args
+        self.load(kind, query, page + 1)
+
+    def _on_list(self, ok, items, append):
+        if not ok:
+            self.status.configure(text=f"Liste nicht ladbar: {items}")
+            return
+        if not append:
+            self.tree.delete(*self.tree.get_children())
+            self.items.clear()
+            for name, mp3 in self.ss.DEFAULT_SOUNDS:  # Standard-Sounds fest oben
+                iid = self.tree.insert("", "end", text="★ " + name,
+                                       values=("✓" if self.ss.downloaded(name, mp3) else "",))
+                self.items[iid] = (name, mp3)
+        for name, mp3, _page in items:
+            if any(mp3 == d for _, d in self.ss.DEFAULT_SOUNDS):
+                continue
+            iid = self.tree.insert("", "end", text=name, values=("✓" if self.ss.downloaded(name, mp3) else "",))
+            self.items[iid] = (name, mp3)
+        self.status.configure(text=f"{len(self.items)} Sounds" + ("" if items else " – keine weiteren"))
+
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.status.configure(text="Bitte einen Sound in der Liste auswählen.")
+            return None, None
+        return sel[0], self.items[sel[0]]
+
+    # ---------------------------------------------------------- Anhören / Laden
+    def _fetch(self, mp3):
+        if mp3 not in self.bytes:
+            self.bytes[mp3] = self.ss.fetch_sound(mp3)
+        return self.bytes[mp3]
+
+    def listen(self):
+        iid, item = self._selected()
+        if not item:
+            return
+        name, mp3 = item
+
+        def run():
+            import soundplayer
+            soundplayer.preview(self._fetch(mp3))
+        self._work(run, lambda ok, v: self.status.configure(text=f"▶ {name}" if ok else f"Abspielen fehlgeschlagen: {v}"),
+                   f"Lade „{name}“ ...")
+
+    def stop(self):
+        import soundplayer
+        soundplayer.stop(soundplayer.PREVIEW)
+        self.status.configure(text="")
+
+    def download(self, pick=False):
+        iid, item = self._selected()
+        if not item:
+            return
+        name, mp3 = item
+
+        def done(ok, path):
+            if not ok:
+                self.status.configure(text=f"Herunterladen fehlgeschlagen: {path}")
+                return
+            self.tree.set(iid, "ok", "✓")
+            self.status.configure(text=f"Gespeichert: {path}")
+            if self.on_download:
+                self.on_download(path, name)
+            if pick and self.on_pick:
+                self.on_pick(path, name)
+                self.close()
+        self._work(lambda: self.ss.save(name, mp3, self._fetch(mp3)), done, f"Lade „{name}“ herunter ...")
+
+    def open_folder(self):
+        os.makedirs(self.ss.SOUND_DIR, exist_ok=True)
+        os.startfile(self.ss.SOUND_DIR)
+
+    def close(self):
+        self.stop()
+        parent = self.master
+        self.destroy()
+        try:
+            parent.grab_set()  # Eingaben wieder an den aufrufenden Dialog
+        except tk.TclError:
+            pass
+
+
+class LinksDialog(tk.Toplevel):
+    """Kleines Fenster mit anklickbaren Links (öffnen im Standard-Browser), nach Gruppen."""
+
+    def __init__(self, parent, title, groups):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        row = 0
+        for head, note, links in groups:
+            ttk.Label(f, text=head, font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=2, sticky="w",
+                                                                        pady=(8 if row else 0, 2))
+            row += 1
+            if note:
+                ttk.Label(f, text=note, foreground=DIM, wraplength=560, justify="left").grid(
+                    row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+                row += 1
+            for name, url, desc in links:
+                a = tk.Label(f, text=name, fg="#1a6fd8", cursor="hand2", font=("Segoe UI", 9, "underline"))
+                a.grid(row=row, column=0, sticky="nw", padx=(8, 12), pady=1)
+                a.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+                tip(a, url)
+                ttk.Label(f, text=desc, wraplength=420, justify="left").grid(row=row, column=1, sticky="w", pady=1)
+                row += 1
+        ttk.Button(f, text="Schließen", command=self.destroy).grid(row=row, column=1, sticky="e", pady=(12, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        TileDialog._place_over(self, parent)
 
 
 # ======================================================================= Automatik-Dialog
@@ -649,6 +925,7 @@ class KnobDialog(tk.Toplevel):
         except OSError:
             self.devices = []
         self.tiles = self._tile_choices()
+        self.rot_tiles = self._rot_tile_choices()
 
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
@@ -742,6 +1019,12 @@ class KnobDialog(tk.Toplevel):
             self.v[key] = tk.StringVar()
             row(key, "Tasten " + label, lambda m, k=key: ttk.Entry(m, textvariable=self.v[k], width=30),
                 help_text + "\nBeispiele: Strg+Plus, Bildab, Alt+Tab, Strg+K, Strg+C (Abfolge mit Komma).")
+        self.v["tile_rot"] = tk.StringVar()
+        row("tile_rot", "Kachel einstellen:",
+            lambda m: ttk.Combobox(m, textvariable=self.v["tile_rot"], state="readonly", width=40,
+                                   values=["(keine)"] + [t for _, t in self.rot_tiles]),
+            "Diese Kachel wird per Drehen eingestellt, z. B. ein Bosch-Rollladen in 10-%-Schritten.\n"
+            "Es stehen nur Kacheln zur Wahl, die sich drehen lassen.")
         tile_labels = ["(keine)"] + [t for _, t in self.tiles]
         for key, label in (("tile_press", "Kachel kurz:"), ("tile_long", "Kachel lang:")):
             self.v[key] = tk.StringVar()
@@ -760,6 +1043,15 @@ class KnobDialog(tk.Toplevel):
         self.wait_window()
 
     # ---------------------------------------------------------- Hilfen
+    def _rot_tile_choices(self):
+        """Kacheln, die sich per Drehknopf einstellen lassen (z. B. Bosch-Rollladen)."""
+        out = []
+        for p, page in enumerate(self.deck_cfg.get("pages", [])):
+            for i, t in enumerate(page):
+                if t and plugin_api.get(t).rotatable:
+                    out.append((f"{p}:{i}", f"Seite {p + 1}, Platz {i + 1}: {tile_label(t)}"))
+        return out
+
     def _tile_choices(self):
         out = []
         for p, page in enumerate(self.deck_cfg.get("pages", [])):
@@ -824,6 +1116,7 @@ class KnobDialog(tk.Toplevel):
         names = dict(self.tiles)
         for k in ("tile_press", "tile_long"):
             self.v[k].set(names.get(p[k], "(keine)"))
+        self.v["tile_rot"].set(dict(self.rot_tiles).get(p.get("tile_rot", ""), "(keine)"))
         for dev_id, v in self.dev_vars.items():
             v.set(dev_id in (p.get("devices") or []))
         self.del_btn.configure(state="normal" if self.current else "disabled")
@@ -844,6 +1137,7 @@ class KnobDialog(tk.Toplevel):
         by_label = {t: ref for ref, t in self.tiles}
         for k in ("tile_press", "tile_long"):
             p[k] = by_label.get(self.v[k].get(), "")
+        p["tile_rot"] = {t: ref for ref, t in self.rot_tiles}.get(self.v["tile_rot"].get(), "")
         p["devices"] = [i for i, v in self.dev_vars.items() if v.get()]
         p["devices_names"] = {d["id"]: d["name"] for d in self.devices if d["id"] in p["devices"]}
         self.presets[self.current] = p
@@ -859,7 +1153,7 @@ class KnobDialog(tk.Toplevel):
                 "keys_left": rot == "keys", "keys_right": rot == "keys",
                 "keysp_left": rotp == "keys", "keysp_right": rotp == "keys",
                 "keys_press": press == "keys", "keys_long": long == "keys",
-                "tile_press": press == "tile", "tile_long": long == "tile"}
+                "tile_press": press == "tile", "tile_long": long == "tile", "tile_rot": "tile" in (rot, rotp)}
         for name, (lab, w) in self.extra_rows.items():
             on = bool(need.get(name))
             lab.configure(foreground="" if on else DIM)
@@ -1131,6 +1425,393 @@ class WifiDialog(tk.Toplevel):
         self._send(f"WIFI EN {1 if on else 0}", 5, lambda ok, lines: self.after(1500 if ok else 0, self.refresh))
 
 
+# ======================================================================= Smart-Home-Dialog
+class BoschDialog(tk.Toplevel):
+    """Bosch Smart Home Controller suchen und koppeln; Geräte für die SmartHome-Seite dieses Decks anhaken."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Bosch Smart Home")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.results = queue.Queue()
+        self.busy = False
+        self.win = parent  # Hauptfenster: Deck, Konfiguration
+        self.checks = {}   # Geräte-ID -> (BooleanVar, Gerät)
+        self.order = [d["id"] for d in (parent.cfg.get("smarthome") or {}).get("devices") or []]
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        self.status = ttk.Label(f, text="", wraplength=500, justify="left")
+        self.status.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        tip(ttk.Label(f, text="Controller:"), "IP-Adresse des Bosch Smart Home Controllers im Heimnetz.").grid(
+            row=1, column=0, sticky="w")
+        self.v_host = tk.StringVar(value=boschshc.settings().get("host", ""))
+        ttk.Entry(f, textvariable=self.v_host, width=20).grid(row=1, column=1, sticky="w", padx=6)
+        self.search_btn = tip(ttk.Button(f, text="Suchen", command=self.search),
+                              "Sucht den Controller im eigenen Netz (dauert ein paar Sekunden).")
+        self.search_btn.grid(row=1, column=2, sticky="w")
+
+        tip(ttk.Label(f, text="Systempasswort:"), "Das Passwort des Controllers aus der Einrichtung – "
+                                                  "tippst du selbst ein.").grid(row=2, column=0, sticky="w",
+                                                                                pady=(6, 0))
+        self.v_pw = tk.StringVar()
+        self.pw_entry = ttk.Entry(f, textvariable=self.v_pw, width=30, show="•")
+        self.pw_entry.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+        tip(self.pw_entry, "Wird nur zum Koppeln an den Controller geschickt und nicht gespeichert.")
+
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=500,
+                  text="Koppeln: 1. Controller suchen (oder IP eintragen), 2. Systempasswort eintippen, "
+                       "3. die Taste am Controller drücken, bis die LEDs blinken, 4. gleich danach "
+                       "„Koppeln“. Die App meldet sich dann mit einem eigenen Zertifikat an (im Controller als "
+                       "„OSS PC-Deck“). Das Passwort wird nicht gespeichert.\n"
+                       "Angehakte Geräte erscheinen auf der Seite „SmartHome“ am Ende dieses Decks. "
+                       "Rollladen: kurz tippen = Drehknopf übernimmt (10 % je Raste, drücken = Stopp), "
+                       "lang = auf/zu. Licht dimmbar (Hue): kurz = Drehknopf dimmt (drücken = an/aus), "
+                       "lang = an/aus. Licht: tippen = an/aus.").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        self.dev_frame = ttk.LabelFrame(f, text=f"Auf der SmartHome-Seite von „{parent.cfg.get('name', '')}“ zeigen",
+                                        padding=8)
+        self.dev_frame.grid(row=4, column=0, columnspan=3, sticky="we", pady=(10, 0))
+
+        b = ttk.Frame(f)
+        b.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        self.pair_btn = tip(ttk.Button(b, text="Koppeln", command=self.pair),
+                            "Erst die Taste am Controller drücken, bis die LEDs blinken.")
+        self.pair_btn.pack(side="left", padx=4)
+        self.list_btn = tip(ttk.Button(b, text="Geräte neu laden", command=self.list_devices),
+                            "Geräteliste vom Controller neu abfragen.")
+        self.list_btn.pack(side="left", padx=4)
+        self.unpair_btn = tip(ttk.Button(b, text="Entkoppeln", command=self.unpair),
+                              "Kopplung in PC-Deck vergessen. Den Eintrag „OSS PC-Deck“ im Controller "
+                              "kannst du in der Bosch-App löschen.")
+        self.unpair_btn.pack(side="left", padx=4)
+        ttk.Button(b, text="Schließen", command=self.close).pack(side="left", padx=(12, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        TileDialog._place_over(self, parent)
+        self._refresh()
+        self.after(100, self._poll)
+        if boschshc.paired():
+            self.list_devices()
+        elif not self.v_host.get():
+            self.search()
+        self.grab_set()
+
+    def _refresh(self):
+        s = boschshc.settings()
+        self.status.configure(text=f"Gekoppelt mit dem Controller {s['host']}." if boschshc.paired()
+                              else "Nicht gekoppelt.")
+        for w in (self.list_btn, self.unpair_btn):
+            w.configure(state="normal" if boschshc.paired() and not self.busy else "disabled")
+        for w in (self.pair_btn, self.search_btn):
+            w.configure(state="disabled" if self.busy else "normal")
+
+    def _work(self, fn, done):
+        self.busy = True
+        self._refresh()
+
+        def run():
+            try:
+                res = (True, fn())
+            except Exception as e:  # Netzwerk, Zertifikat, Controller – Text für den Nutzer
+                res = (False, str(e))
+            self.results.put((done, res))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                done, (ok, val) = self.results.get_nowait()
+                self.busy = False
+                done(ok, val)
+                self._refresh()
+        except queue.Empty:
+            pass
+        self.after(150, self._poll)
+
+    def search(self):
+        self.status.configure(text="Suche den Controller im Netz ...")
+        self._work(boschshc.discover, self._on_search)
+
+    def _on_search(self, ok, found):
+        if ok and found:
+            self.v_host.set(found[0][0])
+            gen = found[0][1].get("shcGeneration", "").replace("SHC_", "Controller ")
+            self.after(10, lambda: self.status.configure(text=f"Gefunden: {gen} unter {found[0][0]}."))
+        else:
+            self.after(10, lambda: self.status.configure(
+                text="Kein Controller gefunden – IP-Adresse von Hand eintragen." if ok else f"Suche: {found}"))
+
+    def pair(self):
+        host, pw = self.v_host.get().strip(), self.v_pw.get()
+        if not host or not pw:
+            messagebox.showinfo("PC-Deck", "Bitte Controller-Adresse und Systempasswort eintragen.", parent=self)
+            return
+        self.status.configure(text="Kopple ... (Zertifikat erzeugen, beim Controller anmelden)")
+        self._work(lambda: boschshc.pair(host, pw), self._on_pair)
+
+    def _on_pair(self, ok, val):
+        self.v_pw.set("")
+        if ok:
+            self.list_devices()
+        else:
+            self.after(10, lambda: self.status.configure(text=f"Koppeln fehlgeschlagen: {val}"))
+
+    def list_devices(self):
+        self._work(lambda: boschshc.devices(max_age=0), self._on_devices)
+
+    def _on_devices(self, ok, devs):
+        for w in self.dev_frame.winfo_children():
+            w.destroy()
+        if not ok:
+            self.after(10, lambda: self.status.configure(text=f"Controller nicht erreichbar: {devs}"))
+            return
+        keep = {i: v.get() for i, (v, _) in self.checks.items()}
+        chosen = set(self.order)
+        self.checks = {}
+        names = {"shutter": "Rollladen", "dimmer": "Licht, dimmbar", "light": "Licht"}
+        usable = sorted((d for d in devs if d["kind"] in names),
+                        key=lambda d: (d["room"].lower(), d["kind"], d["name"]))
+        for n, d in enumerate(usable):
+            v = tk.BooleanVar(value=keep.get(d["id"], d["id"] in chosen))
+            text = f"{names[d['kind']]}: {d['room'] + ' – ' if d['room'] else ''}{d['name']}"
+            ttk.Checkbutton(self.dev_frame, text=text, variable=v).grid(row=n // 2, column=n % 2, sticky="w",
+                                                                          padx=(0, 16))
+            self.checks[d["id"]] = (v, d)
+        if not usable:
+            ttk.Label(self.dev_frame, text="(keine Rollläden oder Lichter gefunden)").grid(row=0, column=0)
+
+    def _save_selection(self):
+        """Angehakte Geräte ins Deck übernehmen (Reihenfolge: bisherige zuerst, neue nach der Liste)."""
+        if not self.checks:
+            return
+        on = [i for i, (v, _) in self.checks.items() if v.get()]
+        ids = [i for i in self.order if i in on] + [i for i in on if i not in self.order]
+        devs = [{"id": i, "kind": self.checks[i][1]["kind"], "name": self.checks[i][1]["name"],
+                 "room": self.checks[i][1]["room"]} for i in ids]
+        old = (self.win.cfg.get("smarthome") or {}).get("devices") or []
+        if devs == old:
+            return
+        self.win.cfg["smarthome"] = {"devices": devs}
+        stored = self.win.config_store.deck_copy(self.win.deck_id)
+        if stored is not None:
+            stored["smarthome"] = {"devices": devs}
+            self.win.config_store.set_deck(self.win.deck_id, stored)
+        link = self.win.manager.link(self.win.deck_id)
+        if link:
+            link.request_sync()
+
+    def unpair(self):
+        if messagebox.askyesno("PC-Deck", "Kopplung mit dem Controller in PC-Deck vergessen?\n"
+                                          "Bosch-Kacheln zeigen dann nichts mehr an.", parent=self):
+            boschshc.unpair()
+            for w in self.dev_frame.winfo_children():
+                w.destroy()
+            self.checks = {}
+            self._refresh()
+            link = self.win.manager.link(self.win.deck_id)
+            if link:
+                link.request_sync()  # SmartHome-Seite verschwindet
+
+    def close(self):
+        self.v_pw.set("")
+        self._save_selection()
+        self.destroy()
+
+
+# ======================================================================= Soundboard-Dialog
+class SoundboardDialog(tk.Toplevel):
+    """Sounds für die Seite „Soundboard“ dieses Decks anhaken (Sound-Ordner), gemeinsame Einstellungen.
+    Neu heruntergeladene Sounds werden sofort angehakt; Jack Black ist von Anfang an dabei."""
+
+    CHECK, EMPTY = "☑", "☐"
+
+    def __init__(self, parent):
+        import soundsearch
+        from plugins import sound as sound_plugin
+        super().__init__(parent)
+        self.ss, self.sp = soundsearch, sound_plugin
+        self.win = parent
+        self.title(f"Soundboard – {parent.cfg.get('name', '')}")
+        self.transient(parent)
+        self.resizable(False, False)
+        sb = dict(parent.cfg.get("soundboard") or {})
+        if "sounds" not in sb:  # erstes Öffnen: Standard-Sounds angehakt
+            sb["sounds"] = [soundsearch.target_path(n, u) for n, u in soundsearch.DEFAULT_SOUNDS]
+        self.checked = list(sb["sounds"])
+        self.colors = dict(sb.get("colors") or {})  # pfad -> Farbname (fehlt = automatisch)
+        self._dots = {}
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, foreground=DIM, wraplength=520, justify="left",
+                  text="Angehakte Sounds erscheinen auf der Seite „Soundboard“ am Ende dieses Decks (vorne die "
+                       "Kachel „Alle stoppen“). Antippen spielt, nochmal antippen stoppt. Klick auf einen Eintrag "
+                       "hakt ihn an oder ab, Rechtsklick wählt die Farbe des Knopfs (sonst automatisch der Reihe "
+                       "nach).").pack(fill="x")
+        mid = ttk.Frame(f)
+        mid.pack(fill="both", expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(mid, columns=("file",), show="tree", height=12, selectmode="none")
+        self.tree.column("#0", width=500)
+        sb_ = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb_.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb_.pack(side="left", fill="y")
+        self.tree.bind("<Button-1>", self._toggle)
+        self.tree.bind("<Button-3>", self._color_menu)
+
+        bt = ttk.Frame(f)
+        bt.pack(fill="x", pady=(6, 0))
+        ttk.Button(bt, text="Sounds suchen ...", command=self.search).pack(side="left")
+        ttk.Button(bt, text="Sound-Ordner öffnen", command=self.open_folder).pack(side="left", padx=4)
+        ttk.Button(bt, text="Liste aktualisieren", command=self.fill).pack(side="left")
+        ttk.Button(bt, text="▶ / ■", width=6, command=self.listen).pack(side="left", padx=(12, 0))
+
+        opt = ttk.LabelFrame(f, text="Für alle Soundboard-Kacheln", padding=8)
+        opt.pack(fill="x", pady=(10, 0))
+        self.v = {}
+        rows = (("volume", "Lautstärke:", sound_plugin.VOLUMES, "100", 12),
+                ("device", "Ausgabegerät:", sound_plugin._out_choices(), "", 46),
+                ("device2", "Zweites Gerät (Discord & Co.):", sound_plugin._out2_choices(), "", 46),
+                ("mode", "Wenn schon ein Sound läuft:", sound_plugin.MODES, "overlay", 46))
+        self.maps = {}
+        for r, (key, label, choices, default, width) in enumerate(rows):
+            ttk.Label(opt, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            cur = sb.get(key, default)
+            if cur not in {v for v, _ in choices}:
+                choices = choices + [(cur, f"{cur} (nicht verbunden)")]
+            self.maps[key] = {lbl: v for v, lbl in choices}
+            var = tk.StringVar(value=next(lbl for v, lbl in choices if v == cur))
+            ttk.Combobox(opt, textvariable=var, state="readonly", width=width,
+                         values=[lbl for _, lbl in choices]).grid(row=r, column=1, sticky="w", padx=(6, 0), pady=2)
+            self.v[key] = var
+        ttk.Label(opt, text=sound_plugin._cable_hint(), foreground=DIM, wraplength=480, justify="left").grid(
+            row=len(rows), column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(12, 0))
+        ttk.Button(b, text="Schließen", command=self.close).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        TileDialog._place_over(self, parent)
+        self.fill()
+        self.grab_set()
+
+    def fill(self):
+        """Angehakte (in ihrer Reihenfolge) zuerst, dann alle übrigen Dateien des Sound-Ordners."""
+        self.tree.delete(*self.tree.get_children())
+        os.makedirs(self.ss.SOUND_DIR, exist_ok=True)
+        files = sorted(os.path.join(self.ss.SOUND_DIR, n) for n in os.listdir(self.ss.SOUND_DIR)
+                       if n.lower().endswith((".mp3", ".wav", ".ogg", ".flac")))
+        on = [p for p in self.checked if os.path.isfile(p)]
+        for p in on + [p for p in files if p not in self.checked]:
+            mark = self.CHECK if p in self.checked else self.EMPTY
+            self.tree.insert("", "end", iid=p, text=f"{mark}  {os.path.splitext(os.path.basename(p))[0]}",
+                             image=self._dot(self._color(p, on)))
+
+    def _color(self, p, on):
+        """Knopffarbe wie auf dem Deck: fest gewählt oder automatisch nach der Reihenfolge; nicht angehakt = grau."""
+        if p not in on:
+            return "#4A4E58"
+        name = self.colors.get(p)
+        if name in self.sp.COLORS:
+            return self.sp.COLORS[name]
+        return self.sp.PALETTE[on.index(p) % len(self.sp.PALETTE)][1]
+
+    def _dot(self, color):
+        if color not in self._dots:
+            from PIL import Image, ImageDraw
+            im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            ImageDraw.Draw(im).ellipse((6, 6, 58, 58), fill=color)
+            self._dots[color] = ImageTk.PhotoImage(im.resize((14, 14), Image.LANCZOS))
+        return self._dots[color]
+
+    def _color_menu(self, ev):
+        p = self.tree.identify_row(ev.y)
+        if not p:
+            return
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="automatisch", command=lambda: self._set_color(p, ""))
+        m.add_separator()
+        for name, hexcol in self.sp.PALETTE:
+            m.add_command(label=name, image=self._dot(hexcol), compound="left",
+                          command=lambda n=name: self._set_color(p, n))
+        m.tk_popup(ev.x_root, ev.y_root)
+
+    def _set_color(self, p, name):
+        if name:
+            self.colors[p] = name
+        else:
+            self.colors.pop(p, None)
+        if name and p not in self.checked:  # Farbe gewählt -> auch aufs Soundboard
+            self.checked.append(p)
+        self.fill()
+
+    def _toggle(self, ev):
+        p = self.tree.identify_row(ev.y)
+        if not p:
+            return
+        if p in self.checked:
+            self.checked.remove(p)
+        else:
+            self.checked.append(p)
+        self._last = p
+        y = self.tree.yview()[0]
+        self.fill()  # Farbpunkte folgen der Reihenfolge
+        self.tree.yview_moveto(y)
+
+    def listen(self):
+        """Zuletzt angeklickten Sound probehören (nochmal = stoppen)."""
+        import soundplayer
+        p = getattr(self, "_last", None)
+        if not p:
+            return
+        if soundplayer.progress(soundplayer.PREVIEW) is not None:
+            soundplayer.stop(soundplayer.PREVIEW)
+            return
+        try:
+            with open(p, "rb") as fh:
+                soundplayer.preview(fh.read())
+        except Exception as e:
+            messagebox.showerror("PC-Deck", f"Abspielen fehlgeschlagen:\n{e}", parent=self)
+
+    def search(self):
+        def downloaded(path, name):  # neu heruntergeladen -> sofort aufs Soundboard
+            if path not in self.checked:
+                self.checked.append(path)
+            if self.winfo_exists():
+                self.fill()
+        SoundSearchDialog(self, on_download=downloaded)
+
+    def open_folder(self):
+        os.makedirs(self.ss.SOUND_DIR, exist_ok=True)
+        os.startfile(self.ss.SOUND_DIR)
+
+    def close(self):
+        import soundplayer
+        soundplayer.stop(soundplayer.PREVIEW)
+        sb = {"sounds": [p for p in self.checked if os.path.isfile(p)]}
+        sb["colors"] = {p: c for p, c in self.colors.items() if p in sb["sounds"]}
+        for key, var in self.v.items():
+            sb[key] = self.maps[key].get(var.get(), "")
+        if sb != self.win.cfg.get("soundboard"):
+            self.win.cfg["soundboard"] = sb
+            stored = self.win.config_store.deck_copy(self.win.deck_id)
+            if stored is not None:
+                stored["soundboard"] = sb
+                self.win.config_store.set_deck(self.win.deck_id, stored)
+            link = self.win.manager.link(self.win.deck_id)
+            if link:
+                link.request_sync()
+        self.destroy()
+
+
 # ======================================================================= Firmware-Dialog
 class FirmwareDialog(tk.Toplevel):
     """Firmware des Decks über die bestehende USB-Verbindung aktualisieren (ab FW 16)."""
@@ -1159,7 +1840,8 @@ class FirmwareDialog(tk.Toplevel):
         self.status = ttk.Label(f, text="", wraplength=440, justify="left")
         self.status.grid(row=3, column=0, columnspan=2, sticky="w")
         ttk.Label(f, foreground=DIM, justify="left", wraplength=440,
-                  text="Die neue Firmware wird über das USB-Kabel übertragen und in den zweiten Programm-Platz "
+                  text="Die neue Firmware wird über USB (ab Firmware 18 auch über WLAN) übertragen und in den "
+                       "zweiten Programm-Platz "
                        "des Decks geschrieben. Erst wenn alles vollständig und die Prüfsumme richtig ist, startet "
                        "das Deck mit ihr neu – bei einem Abbruch läuft die alte Firmware einfach weiter. Kacheln, "
                        "Design, WLAN und Touch-Kalibrierung bleiben erhalten.").grid(
@@ -1188,8 +1870,9 @@ class FirmwareDialog(tk.Toplevel):
         elif link.fw < 16:
             self.status.configure(text=f"Das Deck hat Firmware {link.fw}. Das Update aus der App geht erst ab "
                                        "Firmware 16 – einmalig per USB mit PlatformIO aufspielen (siehe Anleitung).")
-        elif link.via_wlan:
-            self.status.configure(text="Firmware-Update geht nur, wenn das Deck per USB angesteckt ist.")
+        elif link.via_wlan and link.fw < 18:
+            self.status.configure(text=f"Das Deck hat Firmware {link.fw}. Update über WLAN geht erst ab Firmware 18 – "
+                                       "dieses eine Mal per USB anstecken.")
         else:
             self.status.configure(text="Deck wird abgefragt ...")
 
@@ -1254,16 +1937,18 @@ class FirmwareDialog(tk.Toplevel):
         if self.slot and len(data) > self.slot:
             messagebox.showerror("PC-Deck", "Die Firmware ist zu groß für den Programm-Platz des Decks.", parent=self)
             return
-        if not link or link.via_wlan:
-            messagebox.showerror("PC-Deck", "Das Deck ist nicht per USB verbunden.", parent=self)
+        if not link or (link.via_wlan and link.fw < 18):
+            messagebox.showerror("PC-Deck", "Das Deck ist nicht per USB verbunden (über WLAN erst ab Firmware 18).",
+                                 parent=self)
             return
         if inf[0] <= link.fw and not messagebox.askyesno(
                 "PC-Deck", f"Das Deck hat schon Firmware {link.fw}, die Datei ist Firmware {inf[0]}. "
                            "Trotzdem aufspielen?", parent=self):
             return
-        if not messagebox.askyesno("PC-Deck", f"Firmware {inf[0]} ({len(data):,} Byte) jetzt aufspielen?\n\n"
-                                              "USB-Kabel während der Übertragung nicht abziehen.".replace(",", "."),
-                                   parent=self):
+        hint = ("Deck während der Übertragung eingeschaltet und im WLAN lassen." if link.via_wlan else
+                "USB-Kabel während der Übertragung nicht abziehen.")
+        if not messagebox.askyesno("PC-Deck", f"Firmware {inf[0]} ({len(data):,} Byte) jetzt aufspielen?".replace(",", ".")
+                                   + "\n\n" + hint, parent=self):
             return
         self.busy = True
         for w in (self.bundle_btn, self.file_btn, self.close_btn):
@@ -1427,6 +2112,12 @@ class ConfigWindow(tk.Toplevel):
         tip(ttk.Button(bottom, text="Speichern & ans Deck senden", command=self.save),
             "Änderungen speichern. Kacheln, Icons und Design werden nur übertragen, wenn sie sich "
             "geändert haben; die Drehknopf-Belegung gilt sofort.").pack(side="right", padx=6)
+        tip(ttk.Button(bottom, text="Soundboard ...", command=self.edit_soundboard),
+            "Sounds anhaken: daraus entsteht die Seite „Soundboard“ am Ende des Decks. Neue Sounds direkt "
+            "suchen, probehören und herunterladen.").pack(side="right", padx=6)
+        tip(ttk.Button(bottom, text="Smart Home ...", command=self.edit_smarthome),
+            "Bosch Smart Home Controller koppeln: danach gibt es Kacheln für Rollladen und Licht "
+            "(Kachel-Typ „Bosch Smart Home“).").pack(side="right", padx=6)
         tip(ttk.Button(bottom, text="Firmware ...", command=self.edit_firmware),
             "Firmware des Decks über das USB-Kabel aktualisieren (ab Firmware 16) – mitgeliefert oder "
             "eigene .bin-Datei.").pack(side="right", padx=6)
@@ -1771,6 +2462,12 @@ class ConfigWindow(tk.Toplevel):
                                 "USB anstecken.", parent=self)
             return
         WifiDialog(self, self.manager, self.config_store, self.deck_id)
+
+    def edit_soundboard(self):
+        SoundboardDialog(self)
+
+    def edit_smarthome(self):
+        BoschDialog(self)
 
     def edit_firmware(self):
         FirmwareDialog(self, self.manager, self.deck_id)

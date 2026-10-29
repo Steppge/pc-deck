@@ -31,3 +31,6 @@ pcdeck/installer/Output/
 # Gehäuse: Zwischenstände und veraltete Teile
 pcdeck/gehaeuse/_tmp_details/
 pcdeck/gehaeuse/pcdeck_klemme.*
+
+# Übergabe-Notizen für andere Projekte (persönliche Daten)
+UEBERGABE_*.md

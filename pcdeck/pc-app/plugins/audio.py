@@ -225,10 +225,13 @@ def _mic_img(state):
 class MicMute(LiveTileType):
     id = "mic_mute"
     name = "Mikrofon stumm / an"
-    fields = [Field("all_mics", "Alle Mikrofone (nicht nur das Standard-Mikrofon)", kind="bool")]
+    fields = [Field("device", "Mikrofon (z. B. das echte oder das virtuelle von VoiceMeeter):", kind="choice",
+                    default="", choices=lambda: [("", "Standard-Mikrofon")] +
+                    [(d["id"], d["name"]) for d in winaudio.devices(winaudio.CAPTURE)], width=50),
+              Field("all_mics", "Alle Mikrofone (gilt nur bei „Standard-Mikrofon“)", kind="bool")]
 
     def poll(self, tile, ctx):
-        return winaudio.mic_muted(bool(tile.get("all_mics")))
+        return winaudio.mic_muted(bool(tile.get("all_mics")), tile.get("device", ""))
 
     def render(self, tile, state, ctx):
         if state is None:
@@ -237,7 +240,7 @@ class MicMute(LiveTileType):
 
     def on_press(self, tile, ctx):
         try:
-            winaudio.toggle_mic(bool(tile.get("all_mics")))
+            winaudio.toggle_mic(bool(tile.get("all_mics")), tile.get("device", ""))
         except OSError:
             log.warning("Mikrofon stumm: kein Mikrofon gefunden")
 
