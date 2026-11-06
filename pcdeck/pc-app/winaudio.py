@@ -192,6 +192,16 @@ def volume():
         return None
 
 
+def set_volume(percent):
+    """Gesamtlautstärke des Standard-Wiedergabegeräts auf percent (0..100) setzen; über 0 hebt Stumm auf."""
+    with _Com() as com:
+        vol = _default_volume(com, RENDER)
+        new = max(0.0, min(1.0, percent / 100))
+        _check(_method(vol, 7, ctypes.c_float, ctypes.c_void_p)(new, None), "SetMasterVolumeLevelScalar")
+        if percent > 0 and _get_mute(vol):
+            _set_mute(vol, False)
+
+
 def toggle_mute():
     with _Com() as com:
         vol = _default_volume(com, RENDER)

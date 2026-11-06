@@ -10,7 +10,8 @@ import re
 import sys
 
 TAG = re.compile(rb"PCDECK-FW (\d+) ([a-z0-9_]+) ")
-TYPES = {"s3_ts35": "ESP32-S3 + MKS TS35", "esp32_tft35": "ESP32 + BTT TFT35"}
+TYPES = {"s3_ts35": "ESP32-S3 + MKS TS35", "esp32_tft35": "ESP32 + BTT TFT35",
+         "bigdeck": "Big-Deck (9\" ESP32-P4)"}
 
 
 def info(data):
@@ -19,6 +20,14 @@ def info(data):
     if data[:1] != b"\xe9" or not m:  # 0xE9 = Kopf eines ESP32-Programms
         return None
     return int(m.group(1)), m.group(2).decode("ascii")
+
+
+def label(n):
+    """Firmware-Nummer fürs Auge: 33 -> "1.033" (ab Version 1.033 zählen App und Firmware im selben Format)."""
+    try:
+        return f"1.{int(n):03d}"
+    except (TypeError, ValueError):
+        return str(n)
 
 
 def type_name(t):

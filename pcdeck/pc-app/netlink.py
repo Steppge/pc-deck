@@ -93,7 +93,7 @@ def discover(wait=0.6):
 
 
 def connect(ip, port, key):
-    """Anmelden und HELLO: (NetConn, deck_id, layout_hash, fw, design_hash) oder None."""
+    """Anmelden und HELLO: (NetConn, deck_id, layout_hash, fw, design_hash, breite) oder None."""
     try:
         conn = NetConn(ip, port)
     except OSError:
@@ -122,7 +122,11 @@ def connect(ip, port, key):
                         fw = int(parts[1])
                     except ValueError:
                         fw = 1
-                    return conn, parts[4], parts[5], fw, (parts[7] if len(parts) >= 8 else "none")
+                    try:
+                        width = int(parts[2])
+                    except ValueError:
+                        width = 480
+                    return conn, parts[4], parts[5], fw, (parts[7] if len(parts) >= 8 else "none"), width
     except OSError:
         pass
     conn.close()

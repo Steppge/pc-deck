@@ -20,6 +20,7 @@ import tkinter as tk
 from PIL import Image, ImageDraw
 import pystray
 
+import fwfile
 from deck import APP_DIR, Config, DeckManager
 from version import VERSION
 from config_gui import ConfigWindow
@@ -205,6 +206,10 @@ class App:
                 self.window.merge_from_store()
             elif msg and msg.startswith("Kachel gelöscht"):
                 self.window.apply_deletion(self.manager.last_deleted)
+        offer = getattr(self.manager, "fw_offer", None)
+        if msg and "neue Firmware" in msg and offer:  # Abfrage: neue Firmware jetzt installieren?
+            self.manager.fw_offer = None
+            self.root.after(300, lambda: self.ask_firmware(*offer))
         # Neues Deck ohne Kacheln? Dann gleich das Konfigurationsfenster öffnen.
         if msg and msg.endswith(")") and "verbunden (" in msg:
             for did in connected:
@@ -212,6 +217,20 @@ class App:
                 if not any(t for page in d["pages"] for t in page):
                     self.on_open(did)
                     break
+
+    def ask_firmware(self, deck_id, version):
+        """Neue mitgelieferte Firmware: Ja = Fenster mit Bereich „Firmware“ öffnen und gleich aufspielen."""
+        from tkinter import messagebox
+        link = self.manager.link(deck_id)
+        if not link:
+            return
+        name = self.config.deck(deck_id)["name"]
+        if not messagebox.askyesno(APP_NAME, f"Für {name} gibt es neue Firmware {fwfile.label(version)} (das Deck "
+                                             f"hat Firmware {fwfile.label(link.fw)}).\n\nJetzt installieren?", icon="question"):
+            return
+        self.on_open(deck_id)
+        if self.window and self.window.winfo_exists():
+            self.window.show_firmware_update(deck_id)
 
     def on_open(self, deck_id=None):
         if self.window and self.window.winfo_exists():

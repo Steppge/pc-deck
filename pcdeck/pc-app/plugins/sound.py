@@ -134,7 +134,7 @@ def _open_search(dlg):
         if not dlg.v_label.get().strip():
             dlg.v_label.set(name[:24])
         _sp().preload(path)
-    config_gui.SoundSearchDialog(dlg, on_pick=pick)
+    config_gui.SoundSearchDialog(dlg.winfo_toplevel(), on_pick=pick)
 
 
 def _note(d, color):
@@ -151,7 +151,7 @@ class Sound(LiveTileType):
     fields = [Field("file", "Audiodatei (MP3, WAV, OGG, FLAC):", kind="file"),
               Field("search", "Sounds suchen und herunterladen ...", kind="tool", default=_open_search),
               Field("sources", "Freie Sounds finden ...", kind="links", default=SOUND_SOURCES),
-              Field("volume", "Lautstärke:", kind="choice", default="100", choices=VOLUMES, width=12),
+              Field("volume", "Lautstärke:", kind="choice", default="50", choices=VOLUMES, width=12),
               Field("device", "Ausgabegerät:", kind="choice", default="", choices=_out_choices, width=50),
               Field("device2", "Zweites Ausgabegerät (z. B. virtuelles Kabel für Discord & Co.):", kind="choice",
                     default="", choices=_out2_choices, width=50),
@@ -200,7 +200,7 @@ class Sound(LiveTileType):
         else:
             devices = [tile.get("device", "")] + ([tile["device2"]] if tile.get("device2") else [])
             try:
-                missing = sp.play(key, tile.get("file", ""), int(tile.get("volume", "100")) / 100, devices,
+                missing = sp.play(key, tile.get("file", ""), int(tile.get("volume", "50")) / 100, devices,
                                   stop_others=tile.get("mode") == "stop")
             except FileNotFoundError:
                 missing, msg = None, "Sounddatei fehlt"

@@ -37,6 +37,11 @@ STYLE_CODE = {"flat": 0, "vertical": 1, "diagonal": 2, "glass": 3}
 WALLPAPER_DIR = r"C:\Windows\Web\Wallpaper"
 DEFAULT = {"enabled": True, "image": os.path.join(WALLPAPER_DIR, "ThemeA", "img21.jpg"), "tile": "auto",
            "tile_sat": 75, "style": "glass", "bg_brightness": 30, "tile_alpha": 80}
+# Icons (ab App 1.11.4, ab 1.11.5 für jedes Design): Helligkeit -50..50 %, Kontrast 50..150 %, Farbe (Sättigung) 0..200 %,
+# Einfärben mit Farbe und Stärke 0..100 %. Gehört nicht zur Prüfsumme des Designs (die Icons gehen mit den Kacheln).
+ICON_DEFAULT = {"icon_bri": 0, "icon_con": 100, "icon_sat": 100, "icon_tint": False, "icon_tint_color": "#4f8cff",
+                "icon_tint_amt": 50}
+DEFAULT.update(ICON_DEFAULT)
 
 
 # Hintergründe, die die App selbst erzeugt (gleich auf jedem PC): Grundfarbe, Ringfarbe links, rechts
@@ -83,13 +88,102 @@ def settings(cfg):
         return None
     if d == "off":
         return {"enabled": False}
-    return custom(cfg) if d == "custom" else dict(next(t for i, _, t in DESIGNS if i == d))
+    return design_values(cfg, d)
+
+
+# Einstellbare Werte eines Designs (je Design gespeichert; feste Designs in cfg["design_mods"], nur Abweichungen)
+EDIT_KEYS = ("image", "tile", "tile_sat", "style", "bg_brightness", "tile_alpha") + tuple(ICON_DEFAULT)
+
+
+def base_settings(d):
+    """Werkseinstellung eines Designs ("custom" = Grundeinstellung des eigenen Designs)."""
+    t = dict(DEFAULT) if d == "custom" else dict(next(s for i, _, s in DESIGNS if i == d))
+    for k, v in ICON_DEFAULT.items():
+        t.setdefault(k, v)
+    t["enabled"] = True
+    return t
+
+
+def design_values(cfg, d):
+    """Einstellungen des Designs d mit den Änderungen dieses Decks."""
+    if d == "custom":
+        return custom(cfg)
+    t = base_settings(d)
+    t.update(((cfg or {}).get("design_mods") or {}).get(d) or {})
+    return t
+
+
+def with_design(cfg, d, values):
+    """Kopie der Konfiguration mit Design d und diesen Werten (Vorschau, Speichern)."""
+    c = dict(cfg or {})
+    c["design"] = d
+    if values is None or d not in [i for i, _, _ in DESIGNS] + ["custom"]:
+        return c
+    if d == "custom":
+        c["theme"] = dict(values)
+        return c
+    base = base_settings(d)
+    mods = dict(c.get("design_mods") or {})
+    diff = {k: values[k] for k in EDIT_KEYS if k in values and base.get(k) != values[k]}
+    if diff:
+        mods[d] = diff
+    else:
+        mods.pop(d, None)
+    c["design_mods"] = mods
+    return c
 
 
 def is_mono(cfg):
     """Schwarz/Weiß-Design aktiv: Icons gehen in Graustufen ans Deck."""
     t = settings(cfg)
     return bool(t and t.get("enabled") and t.get("mono"))
+
+
+def icon_adjust(cfg):
+    """Icon-Anpassung des gewählten Designs oder None (Icons unverändert)."""
+    s = settings(cfg)
+    if not s or not s.get("enabled"):
+        return None
+    a = {k: s.get(k, v) for k, v in ICON_DEFAULT.items()}
+    if (int(a["icon_bri"]), int(a["icon_con"]), int(a["icon_sat"])) == (0, 100, 100) and \
+            not (a["icon_tint"] and int(a["icon_tint_amt"])):
+        return None
+    return a
+
+
+def _key_mask(rgb):
+    """255, wo ein Pixel genau die Schlüsselfarbe (44,48,58) hat – dort ist das Icon am Deck durchsichtig."""
+    return Image.merge("RGB", [c.point(lambda v, k=k: 255 if v == k else 0)
+                              for c, k in zip(rgb.split(), (44, 48, 58))]).convert("L").point(
+        lambda v: 255 if v == 255 else 0)
+
+
+def adjust_icon(img, a):
+    """Helligkeit, Kontrast, Farbe und Einfärben anwenden; der durchsichtige Hintergrund bleibt exakt erhalten."""
+    rgb = img.convert("RGB")
+    key = _key_mask(rgb)
+    out = rgb
+    if int(a["icon_bri"]):
+        out = ImageEnhance.Brightness(out).enhance(1 + int(a["icon_bri"]) / 100)
+    if int(a["icon_con"]) != 100:
+        out = ImageEnhance.Contrast(out).enhance(int(a["icon_con"]) / 100)
+    if int(a["icon_sat"]) != 100:
+        out = ImageEnhance.Color(out).enhance(int(a["icon_sat"]) / 100)
+    if a["icon_tint"] and int(a["icon_tint_amt"]):
+        tinted = ImageOps.colorize(ImageOps.grayscale(out), black="#000000", white=a["icon_tint_color"])
+        out = Image.blend(out, tinted, int(a["icon_tint_amt"]) / 100)
+    # zufällig entstandene Schlüsselfarbe minimal verschieben (sonst würde das Pixel am Deck durchsichtig)
+    out.paste((44, 48, 59), mask=_key_mask(out))
+    out.paste(rgb, mask=key)
+    return out
+
+
+def deck_icon(img, cfg):
+    """Icon so, wie es ans Deck geht: Schwarz/Weiß-Design grau, eigenes Design mit Icon-Anpassung."""
+    if is_mono(cfg):
+        img = mono_icon(img)
+    a = icon_adjust(cfg)
+    return adjust_icon(img, a) if a else img
 
 
 def mono_icon(img):

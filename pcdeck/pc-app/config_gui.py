@@ -1,5 +1,6 @@
 """Konfigurationsfenster: Kacheln pro Deck anlegen, per Drag & Drop oder Dialog."""
 
+import copy
 import logging
 import os
 import queue
@@ -9,9 +10,10 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 import boschshc
+import deckview
 import fwfile
 import iconextract
 import knob
@@ -23,7 +25,9 @@ import winkeys
 import winsecret
 from paths import APP_DIR
 from version import VERSION
-from deck import FOREGROUND_IGNORE, COLS_RANGE, MAX_PAGES, ROWS_RANGE, auto_apps, empty_page, tile_icon, tile_label
+from deck import (FOREGROUND_IGNORE, COLS_RANGE, MAX_PAGES, ROWS_RANGE, grid_ranges, is_big, SOUND_VOLUME_DEFAULT, add_extra_pages,
+                  auto_apps,
+                  display_opts, empty_page, tile_icon, tile_label)
 
 try:
     from tkinterdnd2 import DND_FILES
@@ -31,10 +35,217 @@ try:
 except ImportError:
     HAVE_DND = False
 
-BG = "#121216"
-TILE = "#2c303a"
-TEXT = "#ebebf0"
-DIM = "#82879a"
+def _windows_colors():
+    """Farben wie Windows: dunkel/hell nach der App-Einstellung, Akzent aus der Akzentfarbe des Nutzers."""
+    light, accent, accent2 = False, (0, 120, 215), (0, 95, 184)
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            light = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 1
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent") as k:
+            pal = bytes(winreg.QueryValueEx(k, "AccentPalette")[0])  # 8 Farben RGBA, hell -> dunkel
+        cols = [tuple(pal[i:i + 3]) for i in range(0, 32, 4)]
+        accent, accent2 = (cols[2], cols[4]) if not light else (cols[4], cols[5])
+    except (OSError, ValueError, IndexError):
+        pass
+    hexc = "#{:02x}{:02x}{:02x}".format
+    if light:
+        c = dict(bg="#f3f3f3", panel="#ebebeb", field="#ffffff", button="#fbfbfb", hover="#e5e5e5",
+                 border="#d0d0d0", text="#1b1b1b", dim="#616161", sel="#dcdcdc")
+    else:
+        c = dict(bg="#202020", panel="#1c1c1c", field="#2b2b2b", button="#2d2d2d", hover="#383838",
+                 border="#3c3c3c", text="#e8e8e8", dim="#9a9a9a", sel="#343434")
+    c.update(accent=hexc(*accent), accent2=hexc(*accent2), accent_rgb=accent, light=light)
+    return c
+
+
+C = _windows_colors()
+BG = C["bg"]
+TILE = C["field"]
+TEXT = C["text"]
+DIM = C["dim"]
+_themed = []
+
+
+def apply_theme(root):
+    """ttk-Design wie Windows 11 (dunkel/hell, Akzentfarbe) – einmal je Programm; dunkle Titelleisten."""
+    if _themed:
+        return
+    _themed.append(True)
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    font = ("Segoe UI", 9)
+    st.configure(".", background=C["bg"], foreground=C["text"], fieldbackground=C["field"],
+                 bordercolor=C["border"], darkcolor=C["bg"], lightcolor=C["bg"], troughcolor=C["field"],
+                 selectbackground=C["accent2"], selectforeground="#ffffff", insertcolor=C["text"], font=font,
+                 focuscolor=C["accent"])
+    st.map(".", foreground=[("disabled", C["dim"])])
+    st.configure("TButton", background=C["button"], bordercolor=C["border"], padding=(10, 4), relief="flat")
+    st.map("TButton", background=[("pressed", C["sel"]), ("active", C["hover"])])
+    st.configure("Accent.TButton", background=C["accent2"], foreground="#ffffff", bordercolor=C["accent2"])
+    st.map("Accent.TButton", background=[("pressed", C["accent2"]), ("active", C["accent"])])
+    for w in ("TEntry", "TCombobox", "TSpinbox"):
+        st.configure(w, fieldbackground=C["field"], foreground=C["text"], arrowcolor=C["text"],
+                     bordercolor=C["border"], background=C["button"], padding=3)
+        st.map(w, fieldbackground=[("readonly", C["field"]), ("disabled", C["bg"])],
+               bordercolor=[("focus", C["accent"])], foreground=[("disabled", C["dim"])])
+    for w in ("TCheckbutton", "TRadiobutton"):
+        st.configure(w, indicatorbackground=C["field"], indicatorforeground=C["text"], background=C["bg"])
+        st.map(w, indicatorbackground=[("selected", C["accent2"])], background=[("active", C["bg"])])
+    st.configure("TLabelframe", background=C["bg"], bordercolor=C["border"])
+    st.configure("TLabelframe.Label", background=C["bg"], foreground=C["text"])
+    st.configure("Treeview", background=C["field"], fieldbackground=C["field"], foreground=C["text"],
+                 bordercolor=C["border"])
+    st.map("Treeview", background=[("selected", C["accent2"])])
+    st.configure("Horizontal.TScale", background=C["accent"], troughcolor=C["field"], bordercolor=C["border"],
+                 lightcolor=C["accent"], darkcolor=C["accent"])
+    st.configure("Panel.TFrame", background=C["panel"])
+    st.configure("Panel.TLabel", background=C["panel"], foreground=C["text"])
+    st.configure("PanelDim.TLabel", background=C["panel"], foreground=C["dim"])
+    st.configure("Head.TLabel", background=C["panel"], foreground=C["text"], font=("Segoe UI Semibold", 11))
+    st.configure("Nav.TButton", background=C["panel"], bordercolor=C["panel"], anchor="w", padding=(12, 7),
+                 font=("Segoe UI", 10))
+    st.map("Nav.TButton", background=[("pressed", C["sel"]), ("active", C["hover"])])
+    st.configure("NavOn.TButton", background=C["sel"], bordercolor=C["accent"], anchor="w", padding=(12, 7),
+                 font=("Segoe UI Semibold", 10))
+    st.configure("Panel.TCheckbutton", background=C["panel"])
+    st.configure("TPanedwindow", background=C["border"])
+    st.configure("Sash", sashthickness=6, gripcount=0, background=C["border"])
+    st.configure("Vertical.TScrollbar", background=C["button"], troughcolor=C["panel"], arrowcolor=C["text"],
+                 bordercolor=C["panel"])
+    st.configure("Horizontal.TScrollbar", background=C["button"], troughcolor=C["panel"], arrowcolor=C["text"],
+                 bordercolor=C["panel"])
+    st.map("Panel.TCheckbutton", background=[("active", C["panel"])])
+    for opt, val in (("*background", C["bg"]), ("*foreground", C["text"]), ("*Listbox.background", C["field"]),
+                     ("*Listbox.selectBackground", C["accent2"]), ("*Menu.background", C["field"]),
+                     ("*Menu.activeBackground", C["accent2"]), ("*TCombobox*Listbox.background", C["field"]),
+                     ("*TCombobox*Listbox.foreground", C["text"]),
+                     ("*TCombobox*Listbox.selectBackground", C["accent2"])):
+        root.option_add(opt, val)
+
+    def dark_title(ev):
+        if C["light"] or not isinstance(ev.widget, (tk.Toplevel, tk.Tk)):
+            return
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(ev.widget.winfo_id())
+            v = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), 4)  # DWMWA_USE_IMMERSIVE_DARK_MODE
+        except Exception:
+            pass
+    root.bind_class("Toplevel", "<Map>", dark_title, add="+")
+
+
+class AutoScroll(ttk.Frame):
+    """Bereich mit Scrollbalken, die nur bei Bedarf erscheinen (senkrecht, auf Wunsch auch waagrecht).
+    Inhalt kommt in .inner; Texte mit Umbruch (wraplength) passen sich der Breite an."""
+    _all = []
+
+    def __init__(self, parent, horizontal=True, style="Panel.TFrame", bg=None):
+        super().__init__(parent, style=style)
+        self.horizontal = horizontal
+        self.canvas = tk.Canvas(self, bg=bg or C["panel"], highlightthickness=0, bd=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.hsb = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.inner = ttk.Frame(self.canvas, style=style)
+        self._win = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self._later())
+        self.canvas.bind("<Configure>", lambda e: self._later())
+        self._after = None
+        self._wrap_w = None
+        AutoScroll._all.append(self)
+        if len(AutoScroll._all) == 1:
+            self.bind_all("<MouseWheel>", AutoScroll._wheel, add="+")
+            self.bind_all("<Shift-MouseWheel>", lambda e: AutoScroll._wheel(e, True), add="+")
+
+    def _later(self):
+        if self._after:
+            self.after_cancel(self._after)
+        self._after = self.after(30, self.update_layout)
+
+    def update_layout(self):
+        self._after = None
+        if not self.winfo_exists():
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 20:
+            return
+        if self._wrap_w != cw:  # Texte an die Breite anpassen, dann neu messen
+            self._wrap_w = cw
+            self.rewrap()
+            self._later()
+            return
+        rw = self.inner.winfo_reqwidth()
+        width = cw if (not self.horizontal or rw <= cw) else rw
+        self.canvas.itemconfigure(self._win, width=width)
+        self.canvas.configure(scrollregion=(0, 0, width, max(self.inner.winfo_reqheight(), 1)))
+        need_v = self.inner.winfo_reqheight() > ch + 1
+        need_h = self.horizontal and rw > cw + 1
+        for bar, need, pos in ((self.vsb, need_v, dict(row=0, column=1, sticky="ns")),
+                               (self.hsb, need_h, dict(row=1, column=0, sticky="ew"))):
+            if need and not bar.winfo_ismapped():
+                bar.grid(**pos)
+            elif not need and bar.winfo_ismapped():
+                bar.grid_remove()
+        if not need_v:
+            self.canvas.yview_moveto(0)
+        if not need_h:
+            self.canvas.xview_moveto(0)
+
+    def rewrap(self):
+        """Umbrechende Texte auf die aktuelle Breite (abzüglich Einrückung) setzen."""
+        cw = self.canvas.winfo_width()
+        stack = list(self.inner.winfo_children())
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            try:
+                if int(str(w.cget("wraplength")) or 0) > 0:
+                    indent = w.winfo_rootx() - self.inner.winfo_rootx() if w.winfo_ismapped() else 20
+                    w.configure(wraplength=max(160, cw - indent - 34))
+            except (tk.TclError, ValueError):
+                pass
+
+    def top(self):
+        self.canvas.yview_moveto(0)
+        self.canvas.xview_moveto(0)
+        self._wrap_w = None
+        self._later()
+
+    @staticmethod
+    def _wheel(ev, horizontal=False):
+        try:
+            w = ev.widget.winfo_containing(ev.x_root, ev.y_root)
+        except (tk.TclError, AttributeError):
+            return
+        if w is None or isinstance(w, (ttk.Combobox, ttk.Spinbox, tk.Listbox, ttk.Treeview)):
+            return
+        AutoScroll._all[:] = [a for a in AutoScroll._all if a.winfo_exists()]
+        for a in AutoScroll._all:
+            if str(w).startswith(str(a)):
+                if horizontal and a.hsb.winfo_ismapped():
+                    a.canvas.xview_scroll(-1 if ev.delta > 0 else 1, "units")
+                elif not horizontal and a.vsb.winfo_ismapped():
+                    a.canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+                return
+
+
+def _place_over(win, parent):
+    """Mittig über dem Hauptfenster, aber immer ganz auf dem Bildschirm."""
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    x = max(0, min(x, sw - w - 10))
+    y = max(0, min(y, sh - h - 80))  # Platz für Titelleiste und Taskleiste
+    win.geometry(f"+{x}+{y}")
 START_MENU = [
     os.path.expandvars(r"%ProgramData%\Microsoft\Windows\Start Menu\Programs"),
     os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
@@ -60,16 +271,18 @@ class _MultiVar:
             b.trace_add(mode, cb)
 
 
-class TileDialog(tk.Toplevel):
-    """Kachel bearbeiten: Typ wählen, darunter die Felder dieses Typs."""
+class TileEditor(ttk.Frame):
+    """Kachel bearbeiten: Typ wählen, darunter die Felder dieses Typs. Steht im Hauptfenster rechts
+    (oder in einem eigenen Fenster). on_done(ergebnis): Kachel, "clear" oder None (Abbrechen)."""
 
-    def __init__(self, parent, tile):
+    def __init__(self, parent, tile, win, on_done, wrap=340):
         super().__init__(parent)
-        self.title("Kachel bearbeiten")
-        self.transient(parent)
-        self.resizable(False, False)
+        self.win = win            # Hauptfenster (Konfiguration des Decks)
+        self.on_done = on_done
+        self.wrap = wrap
         self.result = None
         self.data = dict(tile or {})          # Werte aller Typen (bleiben beim Typwechsel erhalten)
+        self.knob_changes = {}                # programm -> Belegung bzw. False (= Standard), gilt mit OK
         self.type = plugin_api.get(self.data)
         self.vars = {}
 
@@ -90,7 +303,7 @@ class TileDialog(tk.Toplevel):
             self.entries += [(t, f"      {t.name}") for t in types]
         if self.type not in [t for t, _ in self.entries]:  # unbekannter Typ: trotzdem anzeigen
             self.entries.append((self.type, f"      {self.type.name}"))
-        self.type_box = ttk.Combobox(top, state="readonly", width=44, height=24,
+        self.type_box = ttk.Combobox(top, state="readonly", width=34, height=24,
                                      values=[label for _, label in self.entries])
         self.type_box.current([t for t, _ in self.entries].index(self.type))
         self.type_box.pack(side="left", padx=6)
@@ -103,7 +316,7 @@ class TileDialog(tk.Toplevel):
         ttk.Entry(f, textvariable=self.v_label, width=30).grid(row=4, column=0, columnspan=2, sticky="we")
 
         ttk.Label(f, text="Eigenes Icon (optional, .png/.ico/.jpg):").grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
-        ttk.Entry(f, textvariable=self.v_icon, width=48).grid(row=8, column=0, columnspan=3, sticky="we")
+        ttk.Entry(f, textvariable=self.v_icon, width=34).grid(row=8, column=0, columnspan=3, sticky="we")
         ttk.Button(f, text="...", width=4, command=self.pick_icon).grid(row=8, column=3, sticky="w")
         ttk.Checkbutton(f, text="Nur Text anzeigen (kein Icon)", variable=self.v_text_only).grid(
             row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -116,32 +329,28 @@ class TileDialog(tk.Toplevel):
         self.preview.pack(fill="both", expand=True)
 
         b = ttk.Frame(f)
-        b.grid(row=13, column=0, columnspan=4, sticky="e", pady=(16, 0))
-        ttk.Button(b, text="Kachel leeren", command=self.clear).pack(side="left", padx=(0, 24))
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=4)
-        ttk.Button(b, text="OK", command=self.ok).pack(side="left")
+        b.grid(row=13, column=0, columnspan=4, sticky="we", pady=(16, 0))
+        ttk.Button(b, text="Kachel leeren", command=self.clear).pack(side="left")
+        ttk.Button(b, text="OK", style="Accent.TButton", command=self.ok).pack(side="right")
+        ttk.Button(b, text="Abbrechen", command=self.cancel).pack(side="right", padx=4)
 
         for v in (self.v_label, self.v_icon, self.v_text_only):
             v.trace_add("write", lambda *a: self._schedule_preview())
         self._after = None
         self._build_fields()
         self._update_preview()
-        self._place_over(parent)
-        self.bind("<Return>", lambda e: self.ok())
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
-        self.wait_window()
+        self._orig = self._tile()
 
-    def _place_over(self, parent):
-        """Mittig über dem Hauptfenster, aber immer ganz auf dem Bildschirm."""
-        self.update_idletasks()
-        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x = max(0, min(x, sw - w - 10))
-        y = max(0, min(y, sh - h - 80))  # Platz für Titelleiste und Taskleiste
-        self.geometry(f"+{x}+{y}")
+    def _field_w(self, width):
+        """Feldbreite in Zeichen: im schmalen rechten Bereich begrenzt."""
+        return width if self.wrap > 400 or not width else min(width, 36)
+
+    def changed(self):
+        """Wurde seit dem Öffnen etwas geändert (Felder oder Drehknopf)?"""
+        return bool(self.knob_changes) or self._tile() != self._orig
+
+    def cancel(self):
+        self.on_done(None)
 
     # ---------------------------------------------------------- Felder des Typs
     @staticmethod
@@ -168,7 +377,7 @@ class TileDialog(tk.Toplevel):
             if fld.kind == "info":  # nur Hinweistext (Text/Link dürfen Funktionen sein), wird nicht gespeichert
                 text = fld.label() if callable(fld.label) else fld.label
                 url = fld.default() if callable(fld.default) else fld.default
-                ttk.Label(self.fields_frame, text=text, foreground=DIM, wraplength=460, justify="left").grid(
+                ttk.Label(self.fields_frame, text=text, foreground=DIM, wraplength=self.wrap, justify="left").grid(
                     row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
                 row += 1
                 if url:
@@ -184,7 +393,8 @@ class TileDialog(tk.Toplevel):
                 continue
             if fld.kind == "links":  # Schaltfläche -> Fenster mit Links (wird nicht gespeichert)
                 ttk.Button(self.fields_frame, text=fld.label,
-                           command=lambda f=fld: LinksDialog(self, f.label.rstrip(" ."), f.default)).grid(
+                           command=lambda f=fld: LinksDialog(self.winfo_toplevel(), f.label.rstrip(" ."),
+                                                             f.default)).grid(
                     row=row, column=0, sticky="w", pady=(6, 0))
                 row += 1
                 continue
@@ -195,7 +405,8 @@ class TileDialog(tk.Toplevel):
                 w.grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
                 row += 1
             elif fld.kind == "multi":
-                ttk.Label(self.fields_frame, text=fld.label).grid(row=row, column=0, columnspan=4, sticky="w",
+                ttk.Label(self.fields_frame, text=fld.label, wraplength=self.wrap,
+                          justify="left").grid(row=row, column=0, columnspan=4, sticky="w",
                                                                   pady=(6, 0))
                 row += 1
                 checked = list(val) if isinstance(val, list) else []
@@ -221,7 +432,8 @@ class TileDialog(tk.Toplevel):
                 text = fld.label
                 if secret and val:
                     text += "  (gespeichert – leer lassen zum Beibehalten)"
-                ttk.Label(self.fields_frame, text=text).grid(row=row, column=0, columnspan=4, sticky="w",
+                ttk.Label(self.fields_frame, text=text, wraplength=self.wrap,
+                          justify="left").grid(row=row, column=0, columnspan=4, sticky="w",
                                                              pady=(6, 0))
                 row += 1
                 if fld.kind == "choice":
@@ -233,7 +445,7 @@ class TileDialog(tk.Toplevel):
                         choices.append((cur, f"{name} (nicht verbunden)"))
                     elif not cur and choices and not fld.default:
                         var.set(choices[0][0])
-                    w = ttk.Combobox(self.fields_frame, state="readonly", width=fld.width,
+                    w = ttk.Combobox(self.fields_frame, state="readonly", width=self._field_w(fld.width),
                                      values=[lbl for _, lbl in choices])
                     labels = {v: l for v, l in choices}
                     values = {l: v for v, l in choices}
@@ -241,16 +453,18 @@ class TileDialog(tk.Toplevel):
                     w.configure(textvariable=var)
                     var._map = values  # Anzeige -> Wert
                 else:
-                    w = ttk.Entry(self.fields_frame, textvariable=var, width=fld.width,
+                    w = ttk.Entry(self.fields_frame, textvariable=var, width=self._field_w(fld.width),
                                   show="•" if secret else "")
                 w.grid(row=row, column=0, columnspan=4, sticky="we", pady=(2, 0))
                 row += 1
                 if fld.kind == "path":
                     bf = ttk.Frame(self.fields_frame)
                     bf.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
-                    ttk.Button(bf, text="Programm / Datei ...", command=lambda v=var: self.pick_file(v)).pack(side="left")
+                    ttk.Button(bf, text="Programm / Datei ..." if self.wrap > 400 else "Datei ...",
+                               command=lambda v=var: self.pick_file(v)).pack(side="left")
                     ttk.Button(bf, text="Ordner ...", command=lambda v=var: self.pick_folder(v)).pack(side="left", padx=4)
-                    ttk.Button(bf, text="Aus dem Startmenü ...", command=lambda v=var: self.pick_startmenu(v)).pack(side="left")
+                    ttk.Button(bf, text="Aus dem Startmenü ..." if self.wrap > 400 else "Startmenü ...",
+                               command=lambda v=var: self.pick_startmenu(v)).pack(side="left")
                     row += 1
                 elif fld.kind == "file":
                     ttk.Button(self.fields_frame, text="...", width=4,
@@ -260,6 +474,53 @@ class TileDialog(tk.Toplevel):
                 self._dependents.append((w, fld.enabled_by))
             var.trace_add("write", lambda *a: (self._update_dependents(), self._schedule_preview()))
         self._update_dependents()
+        self.knob_lbl = None
+        if self.type.id == plugin_api.DEFAULT_TYPE and "path" in self.vars:  # Programm / Ordner / Datei
+            kf = ttk.Frame(self.fields_frame)
+            kf.grid(row=row, column=0, columnspan=4, sticky="w", pady=(10, 0))
+            tip(ttk.Button(kf, text="Drehknopf ...", command=self.edit_knob),
+                "Belegung des Drehknopfs, solange dieses Programm im Vordergrund ist.").pack(side="left")
+            self.knob_lbl = ttk.Label(kf, foreground=DIM, wraplength=self.wrap - 110, justify="left")
+            self.knob_lbl.pack(side="left", padx=(8, 0))
+            self.vars["path"].trace_add("write", lambda *a: self._update_knob_label())
+            self._update_knob_label()
+
+    # ---------------------------------------------------------- Drehknopf dieser Kachel
+    def _knob_app(self):
+        return winctl.knob_app(self._value(self.vars["path"]).strip().strip('"')) if "path" in self.vars else None
+
+    def _knob_preset(self, app):
+        """Belegung des Programms: in diesem Fenster geändert, sonst gespeichert; None = Standard."""
+        if app in self.knob_changes:
+            return self.knob_changes[app] or None
+        return knob.settings(self.win.cfg)["apps"].get(app)
+
+    def _update_knob_label(self):
+        if not self.knob_lbl:
+            return
+        app = self._knob_app()
+        if not app:
+            self.knob_lbl.configure(text="(erst Programm, Ordner oder Datei wählen)")
+            return
+        p = self._knob_preset(app)
+        if not p:
+            text = f"{app}: Standard (Lautstärke)"
+        else:
+            text = f"{app}: drehen = {KnobDialog._label_of(knob.ROT_ACTIONS, p['rot'])}, drücken = " \
+                   f"{KnobDialog._label_of(knob.PRESS_ACTIONS, p['press'])}"
+        self.knob_lbl.configure(text=text)
+
+    def edit_knob(self):
+        app = self._knob_app()
+        if not app:
+            messagebox.showinfo("Drehknopf", "Bitte zuerst ein Programm, einen Ordner oder eine Datei wählen.",
+                                parent=self)
+            return
+
+        def apply(p):
+            self.knob_changes[app] = p
+            self._update_knob_label()
+        KnobDialog(self.winfo_toplevel(), app, self._knob_preset(app), self.win.cfg, apply)
 
     def _update_dependents(self):
         for w, key in self._dependents:
@@ -363,8 +624,7 @@ class TileDialog(tk.Toplevel):
             self.v_icon.set(os.path.normpath(p))
 
     def clear(self):
-        self.result = "clear"
-        self.destroy()
+        self.on_done("clear")
 
     def ok(self):
         t = self._tile()
@@ -373,10 +633,32 @@ class TileDialog(tk.Toplevel):
                 t = self.type.prepare(t)
             except Exception:
                 logging.getLogger("pcdeck").exception("Fehler beim Speichern der Kachel")
-            self.result = t
+            self.on_done(t)
         else:
-            self.result = "clear"
-        self.destroy()
+            self.on_done("clear")
+
+
+class TileDialog(tk.Toplevel):
+    """Kachel bearbeiten in einem eigenen Fenster (TileEditor); _place_over für alle Dialoge."""
+    _place_over = staticmethod(_place_over)
+
+    def __init__(self, parent, tile, win=None):
+        super().__init__(parent)
+        self.title("Kachel bearbeiten")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+        self.knob_changes = {}
+
+        def done(res):
+            self.result, self.knob_changes = res, ed.knob_changes
+            self.destroy()
+        ed = TileEditor(self, tile, win or parent, done, wrap=460)
+        ed.pack(fill="both", expand=True)
+        _place_over(self, parent)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+        self.wait_window()
 
 
 class SoundSearchDialog(tk.Toplevel):
@@ -620,11 +902,100 @@ class LinksDialog(tk.Toplevel):
 
 
 # ======================================================================= Automatik-Dialog
-class AutoDialog(tk.Toplevel):
+class _Pane(ttk.Frame):
+    """Inhalt im rechten Feld des Hauptfensters (statt eigenem Fenster). Die Fenster-Aufrufe der früheren
+    Dialoge (title, transient, grab_set, wait_window ...) wirken hier nicht bzw. setzen die Überschrift."""
+
+    def __init__(self, win):
+        super().__init__(win.side, padding=(16, 12))
+        self.win = win
+        self._head = ttk.Label(self, font=("Segoe UI Semibold", 11))
+        self._head.pack(anchor="w", pady=(0, 6))
+        self.pack(fill="both", expand=True)
+        win.pane = self
+
+    def title(self, text=None):
+        if text is not None:
+            self._head.configure(text=text)
+        return self._head.cget("text")
+
+    def transient(self, *a):
+        pass
+
+    def resizable(self, *a):
+        pass
+
+    def grab_set(self):
+        pass
+
+    def wait_window(self, *a):
+        pass
+
+    def protocol(self, *a):
+        pass
+
+    def geometry(self, *a):
+        pass
+
+    def changed(self):
+        """Offene Änderungen? (für die Nachfrage beim Wechsel)"""
+        return False
+
+    def accept(self):
+        """Wie OK."""
+        (getattr(self, "_ok", None) or getattr(self, "close"))()
+
+    def destroy(self):
+        super().destroy()
+        self.win._pane_closed(self)
+
+
+class _OkCancel:
+    """OK übernimmt (apply: speichern und sofort ans Deck), Abbrechen verwirft alle Änderungen.
+    Die Unterklasse liefert den Wert mit _current(strict) (None = Eingabe ungültig, Fenster bleibt offen)."""
+
+    def _ok_buttons(self, frame, apply):
+        self._apply = apply
+        ttk.Button(frame, text="Abbrechen", command=self._cancel).pack(side="left", padx=4)
+        ttk.Button(frame, text="OK", style="Accent.TButton", command=self._ok).pack(side="left")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+        self.after_idle(self._snapshot)
+
+    def _snapshot(self):
+        try:
+            self._start = self._current(False)
+        except Exception:
+            self._start = None
+
+    def changed(self):
+        try:
+            return self._current(False) != getattr(self, "_start", None)
+        except Exception:
+            return False
+
+    def _ok(self):
+        cur = self._current(True)
+        if cur is None:
+            return
+        self._ended(True)
+        self._apply(cur)
+        self.destroy()
+
+    def _cancel(self):
+        self._ended(False)
+        self.destroy()
+
+    def _ended(self, ok):
+        """Für Unterklassen: Fenster wird mit OK (True) bzw. Abbrechen (False) geschlossen."""
+
+
+class AutoDialog(_OkCancel, _Pane):
     """Programme, bei denen das Deck automatisch auf diese Seite springt."""
 
-    def __init__(self, parent, page_no, apps, elsewhere=None):
-        """elsewhere: {programm_klein: seitennummer} – schon auf einer anderen Seite eingetragen."""
+    def __init__(self, parent, page_no, apps, elsewhere=None, apply=None):
+        """elsewhere: {programm_klein: seitennummer} – schon auf einer anderen Seite eingetragen.
+        apply(liste): bei OK (speichern und sofort ans Deck)."""
         super().__init__(parent)
         self.title(f"Automatik – Seite {page_no}")
         elsewhere = elsewhere or {}
@@ -641,9 +1012,9 @@ class AutoDialog(tk.Toplevel):
 
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
-        ttk.Label(f, text=f"Kommt eines dieser Programme in den Vordergrund, zeigt das Deck Seite {page_no}.\n"
+        ttk.Label(f, text=f"Kommt eines dieser Programme in den Vordergrund, zeigt das Deck Seite {page_no}. "
                           "Verlässt du es, springt das Deck auf die zuletzt selbst gewählte Seite zurück.",
-                  justify="left").pack(anchor="w")
+                  justify="left", wraplength=360).pack(anchor="w")
         ttk.Label(f, text="Gerade laufende Programme:").pack(anchor="w", pady=(10, 2))
         box = ttk.Frame(f)
         box.pack(anchor="w", padx=(8, 0))
@@ -657,24 +1028,23 @@ class AutoDialog(tk.Toplevel):
             ttk.Label(box, text="(keine gefunden)").pack(anchor="w")
         run_low = {a.lower() for a in running}
         others = [a for a in current if a.lower() not in run_low]
-        ttk.Label(f, text="Weitere Programme (laufen gerade nicht), durch Komma getrennt, z. B. LightBurn.exe:").pack(
-            anchor="w", pady=(10, 2))
+        ttk.Label(f, text="Weitere Programme (laufen gerade nicht), durch Komma getrennt, z. B. LightBurn.exe:",
+                  wraplength=360, justify="left").pack(anchor="w", pady=(10, 2))
         if elsewhere:
             ttk.Label(f, foreground=DIM, text="Ein Programm kann nur auf einer Seite stehen – "
-                      "hier eingetragen, wird es auf der anderen Seite entfernt.").pack(anchor="w")
+                      "hier eingetragen, wird es auf der anderen Seite entfernt.", wraplength=360,
+                      justify="left").pack(anchor="w")
         self.v_other = tk.StringVar(value=", ".join(others))
-        ttk.Entry(f, textvariable=self.v_other, width=60).pack(anchor="w", fill="x")
+        ttk.Entry(f, textvariable=self.v_other, width=40).pack(anchor="w", fill="x")
 
         b = ttk.Frame(f)
         b.pack(anchor="e", pady=(14, 0))
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=4)
-        ttk.Button(b, text="OK", command=self.ok).pack(side="left")
-        self.bind("<Escape>", lambda e: self.destroy())
+        self._ok_buttons(b, apply)
         TileDialog._place_over(self, parent)
         self.grab_set()
         self.wait_window()
 
-    def ok(self):
+    def _current(self, strict=False):
         apps = [a for a, v in self.checks if v.get()]
         for a in self.v_other.get().replace(";", ",").split(","):
             a = a.strip().strip('"')
@@ -682,120 +1052,7 @@ class AutoDialog(tk.Toplevel):
                 a += ".exe"
             if a and a.lower() not in {x.lower() for x in apps}:
                 apps.append(a)
-        self.result = apps
-        self.destroy()
-
-
-# ======================================================================= Design-Dialog
-class ThemeDialog(tk.Toplevel):
-    """Hintergrund und Farben eines Decks: Bild, Kachelfarbe, Stil, Helligkeit, Deckkraft – mit Vorschau."""
-
-    def __init__(self, parent, settings, icons=()):
-        super().__init__(parent)
-        self.title("Eigenes Design")
-        self.transient(parent)
-        self.resizable(False, False)
-        self.result = None
-        self.icons = list(icons)[:8]
-        t = dict(settings)
-        self.v_on = tk.BooleanVar(value=bool(t.get("enabled")))
-        self.v_image = tk.StringVar(value=t.get("image", ""))
-        self.v_auto = tk.BooleanVar(value=not str(t.get("tile", "auto")).startswith("#"))
-        self.tile_color = t.get("tile") if str(t.get("tile", "")).startswith("#") else "#0a1b4b"
-        self.v_sat = tk.IntVar(value=int(t.get("tile_sat", 75)))
-        self.v_style = tk.StringVar(value=dict(theme.STYLES).get(t.get("style", "glass"), "Glas (Verlauf + Glanz)"))
-        self.v_bri = tk.IntVar(value=int(t.get("bg_brightness", 30)))
-        self.v_alpha = tk.IntVar(value=int(t.get("tile_alpha", 80)))
-
-        f = ttk.Frame(self, padding=12)
-        f.pack(fill="both", expand=True)
-        left = ttk.Frame(f)
-        left.grid(row=0, column=0, sticky="nw")
-        ttk.Checkbutton(left, text="Design verwenden (Startbild, Hintergrund, Kachelfarben)", variable=self.v_on).grid(
-            row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(left, text="Bild:").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(left, textvariable=self.v_image, width=44).grid(row=2, column=0, columnspan=2, sticky="we")
-        ttk.Button(left, text="Bild wählen ...", command=self.pick_image).grid(row=2, column=2, padx=(4, 0))
-
-        ttk.Checkbutton(left, text="Kachelfarbe automatisch aus dem Bild", variable=self.v_auto).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        row = ttk.Frame(left)
-        row.grid(row=4, column=0, columnspan=3, sticky="w")
-        ttk.Label(row, text="Farbstärke:").pack(side="left")
-        ttk.Scale(row, from_=10, to=100, variable=self.v_sat, length=150).pack(side="left", padx=4)
-        self.color_btn = tk.Button(row, text="Eigene Farbe ...", command=self.pick_color, relief="groove")
-        self.color_btn.pack(side="left", padx=(10, 0))
-
-        ttk.Label(left, text="Kachel-Stil:").grid(row=5, column=0, sticky="w", pady=(10, 0))
-        ttk.Combobox(left, state="readonly", textvariable=self.v_style, width=26,
-                     values=[n for _, n in theme.STYLES]).grid(row=5, column=1, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(left, text="Hintergrund-Helligkeit:").grid(row=6, column=0, sticky="w", pady=(10, 0))
-        ttk.Scale(left, from_=10, to=70, variable=self.v_bri, length=180).grid(row=6, column=1, columnspan=2,
-                                                                              sticky="w", pady=(10, 0))
-        ttk.Label(left, text="Kachel-Deckkraft:").grid(row=7, column=0, sticky="w", pady=(6, 0))
-        ttk.Scale(left, from_=40, to=100, variable=self.v_alpha, length=180).grid(row=7, column=1, columnspan=2,
-                                                                                 sticky="w", pady=(6, 0))
-
-        self.preview = tk.Label(f, bg="#000000")
-        self.preview.grid(row=0, column=1, padx=(16, 0), sticky="n")
-        b = ttk.Frame(f)
-        b.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=4)
-        ttk.Button(b, text="OK", command=self.ok).pack(side="left")
-
-        self._after = None
-        for v in (self.v_on, self.v_image, self.v_auto, self.v_sat, self.v_style, self.v_bri, self.v_alpha):
-            v.trace_add("write", lambda *a: self._schedule())
-        self._update()
-        TileDialog._place_over(self, parent)
-        self.bind("<Escape>", lambda e: self.destroy())
-        self.grab_set()
-        self.wait_window()
-
-    def _settings(self):
-        style = next((k for k, n in theme.STYLES if n == self.v_style.get()), "glass")
-        return {"enabled": bool(self.v_on.get()), "image": self.v_image.get().strip().strip('"'),
-                "tile": "auto" if self.v_auto.get() else self.tile_color, "tile_sat": int(self.v_sat.get()),
-                "style": style, "bg_brightness": int(self.v_bri.get()), "tile_alpha": int(self.v_alpha.get())}
-
-    def _schedule(self):
-        if self._after:
-            self.after_cancel(self._after)
-        self._after = self.after(250, self._update)
-
-    def _update(self):
-        self.color_btn.configure(bg=self.tile_color, fg="#ffffff",
-                                 state="disabled" if self.v_auto.get() else "normal")
-        img = None
-        try:
-            img = theme.preview(self._settings(), self.icons) if self.v_on.get() else None
-        except Exception:
-            img = None
-        if img is None:
-            self._photo = None
-            self.preview.configure(image="", text="(kein Design)", fg="#ffffff", width=40, height=10)
-            return
-        self._photo = ImageTk.PhotoImage(img.resize((360, 240)))
-        self.preview.configure(image=self._photo, text="", width=360, height=240)
-
-    def pick_image(self):
-        start = os.path.dirname(self.v_image.get()) if os.path.isdir(os.path.dirname(self.v_image.get())) \
-            else theme.WALLPAPER_DIR
-        p = filedialog.askopenfilename(parent=self, title="Hintergrundbild wählen", initialdir=start,
-                                       filetypes=[("Bilder", "*.jpg *.jpeg *.png *.bmp"), ("Alle", "*.*")])
-        if p:
-            self.v_image.set(os.path.normpath(p))
-
-    def pick_color(self):
-        from tkinter import colorchooser
-        c = colorchooser.askcolor(color=self.tile_color, parent=self, title="Kachelfarbe")[1]
-        if c:
-            self.tile_color = c
-            self._update()
-
-    def ok(self):
-        self.result = self._settings()
-        self.destroy()
+        return apps
 
 
 # ======================================================================= Info-Popups
@@ -822,7 +1079,7 @@ class Tip:
         self.win = tk.Toplevel(self.widget)
         self.win.wm_overrideredirect(True)
         self.win.attributes("-topmost", True)
-        tk.Label(self.win, text=self.text, justify="left", wraplength=420, bg="#ffffe1", fg="#000000",
+        tk.Label(self.win, text=self.text, justify="left", wraplength=420, bg=C["field"], fg=C["text"],
                  relief="solid", borderwidth=1, padx=8, pady=5, font=("Segoe UI", 9)).pack()
         self.win.update_idletasks()
         # nicht über den rechten/unteren Bildschirmrand hinaus
@@ -853,7 +1110,7 @@ TILE_TIP = ("Klick: bearbeiten  •  Rechtsklick: kopieren, einfügen, leeren\n"
 APP_HELP = """Kacheln
   • Programme, Verknüpfungen oder Ordner aus dem Explorer auf eine Kachel ziehen –
     oder Kachel anklicken und einen Typ wählen (Uhr, Lautstärke, Medien, Tastenkürzel …).
-  • „Speichern & ans Deck senden“ überträgt die Änderungen.
+  • Änderungen gehen sofort ans Deck – in Fenstern wie „Kachel bearbeiten“ mit „OK“.
 
 Am Deck
   • Kurz tippen: Programm öffnen bzw. minimieren / zurückholen.
@@ -879,8 +1136,11 @@ WLAN (optional)
   • Ist der PC gesperrt (Win+L), lösen Deck und Drehknopf nichts aus („PC gesperrt“).
 
 Drehknopf
-  • Drehen, gedrückt drehen, kurz und lang drücken – Belegung unter „Drehknopf …“,
-    als Standard und je Programm im Vordergrund.
+  • Standard: drehen = Lautstärke, gedrückt drehen = Ausgabegerät, kurz drücken = stumm,
+    lang drücken (1,5 s) = herunterfahren, zweimal schnell = Energie sparen – beide mit 10 s
+    Countdown am Deck, Drücken bricht ab.
+  • Eigene Belegung je Programm: Kachel bearbeiten → „Drehknopf ...“ – gilt, solange das
+    Programm im Vordergrund ist.
 
 Tipp: Bleibt die Maus kurz über einer Schaltfläche stehen, erscheint eine Erklärung."""
 
@@ -890,36 +1150,39 @@ KNOB_HELP = """Der Drehknopf am Deck kennt vier Bewegungen:
   • Drehen
   • Gedrückt drehen (Knopf festhalten und drehen)
   • Kurz drücken
-  • Lang drücken (ab 0,6 Sekunden)
+  • Lang drücken (ab 1,5 Sekunden, das Deck zeigt dann einen roten Rahmen)
 
-Was dabei passiert, legst du hier fest:
-  • „Standard“ gilt immer, wenn kein Programm-Preset passt.
-  • Ein Programm-Preset gilt, solange dieses Programm im Vordergrund ist
-    (z. B. Discord: drehen = Discord-Lautstärke, drücken = Mikrofon stumm;
-    Edge: drehen = scrollen, drücken = Screenshot).
+Standard (immer, wenn kein Programm eine eigene Belegung hat):
+  Drehen = Lautstärke, gedrückt drehen = Ausgabegerät wechseln, kurz drücken = Ton stumm,
+  lang drücken = Herunterfahren (10 s Countdown am Deck, Drücken bricht ab),
+  zweimal schnell drücken = Energie sparen (ebenfalls 10 s Countdown, Drücken bricht ab).
+
+Eigene Belegung für ein Programm stellst du in dessen Kachel ein („Drehknopf ...“).
+Sie gilt, solange dieses Programm im Vordergrund ist
+(z. B. Discord: drehen = Discord-Lautstärke, drücken = Mikrofon stumm;
+Edge: drehen = scrollen, drücken = Screenshot).
 
 Hinweise:
+  • Mehrere Kacheln desselben Programms teilen sich die Belegung.
+  • Ordner-Kacheln: die Belegung gilt für alle Explorer-Fenster.
   • „Lautstärke des Programms“ verstellt nur den Regler dieses Programms im
     Windows-Lautstärkemischer – andere Programme bleiben gleich laut.
     Das Programm muss dafür gerade Ton ausgeben bzw. im Mischer stehen.
   • Scrollen und Zoomen wirken auf das Fenster unter dem Mauszeiger.
-  • Bei Lautstärke, Ausgabegerät und Seite zeigt das Deck kurz den neuen Wert an.
-  • Änderungen gelten nach „Speichern & ans Deck senden“ sofort."""
+  • Bei Lautstärke, Ausgabegerät und Seite zeigt das Deck kurz den neuen Wert an."""
 
 
-class KnobDialog(tk.Toplevel):
-    """Belegung des Drehknopfs: Standard und Presets pro Programm (Vordergrund)."""
+class KnobDialog(_OkCancel, tk.Toplevel):
+    """Drehknopf-Belegung für ein Programm (aus dem Kachel-Fenster): Standard oder eigene Belegung.
+    apply(preset oder None) bei OK; None = Standard (keine eigene Belegung)."""
 
-    def __init__(self, parent, settings, deck_cfg):
+    def __init__(self, parent, app, preset, deck_cfg, apply):
         super().__init__(parent)
-        self.title("Drehknopf")
+        self.title(f"Drehknopf – {app}")
         self.transient(parent)
         self.resizable(False, False)
-        self.result = None
-        self.presets = {"": dict(settings["default"])}
-        self.presets.update({a: dict(p) for a, p in settings["apps"].items()})
         self.deck_cfg = deck_cfg
-        self.current = None
+        self.p = knob.preset(preset)
         try:
             self.devices = winaudio.devices(winaudio.RENDER)
         except OSError:
@@ -931,34 +1194,24 @@ class KnobDialog(tk.Toplevel):
         f.pack(fill="both", expand=True)
         head = ttk.Frame(f)
         head.pack(fill="x")
-        ttk.Label(head, text="Belegung je nach Programm im Vordergrund:").pack(side="left")
+        ttk.Label(head, text=f"Solange {app} im Vordergrund ist:").pack(side="left")
         tip(ttk.Button(head, text="?", width=3, command=self._help), "Ausführliche Erklärung zum Drehknopf").pack(
             side="right")
+        self.v_own = tk.BooleanVar(value=preset is not None)
+        ttk.Radiobutton(f, text="Standard (drehen = Lautstärke, gedrückt drehen = Ausgabegerät, drücken = stumm, "
+                        "lang = herunterfahren, doppelt = Energie sparen)", variable=self.v_own, value=False,
+                        command=self._update).pack(anchor="w", pady=(8, 0))
+        ttk.Radiobutton(f, text="Eigene Belegung:", variable=self.v_own, value=True,
+                        command=self._update).pack(anchor="w")
+        hint = "Gilt für alle Kacheln dieses Programms."
+        if app.lower() == "explorer.exe":
+            hint += " Bei Ordnern: für alle Explorer-Fenster."
+        ttk.Label(f, text=hint, foreground=DIM).pack(anchor="w", padx=(22, 0))
 
-        body = ttk.Frame(f)
-        body.pack(fill="both", expand=True, pady=(8, 0))
-
-        # links: Standard + Programme
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="y")
-        self.listbox = tk.Listbox(left, width=26, height=14, exportselection=False, activestyle="none")
-        self.listbox.pack(fill="y", expand=True)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-        tip(self.listbox, "„Standard“ gilt für alle Programme ohne eigenes Preset.\n"
-                          "Ein Programm-Preset gilt, solange das Programm im Vordergrund ist.")
-        lb = ttk.Frame(left)
-        lb.pack(fill="x", pady=(6, 0))
-        tip(ttk.Button(lb, text="+ Programm ...", command=self._add_app),
-            "Preset für ein Programm anlegen – zur Auswahl stehen die Programme deiner Kacheln "
-            "und die gerade laufenden.").pack(side="left")
-        self.del_btn = tip(ttk.Button(lb, text="Entfernen", command=self._del_app),
-                           "Preset des markierten Programms löschen (danach gilt dort wieder „Standard“).")
-        self.del_btn.pack(side="left", padx=(6, 0))
-
-        # rechts: die vier Bewegungen + Zusatzfelder
-        right = ttk.Frame(body, padding=(14, 0, 0, 0))
-        right.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(f, padding=(22, 6, 0, 0))
+        right.pack(fill="both", expand=True)
         self.v = {}
+        self.main_rows = []
         rot_labels = [t for _, t in knob.ROT_ACTIONS]
         press_labels = [t for _, t in knob.PRESS_ACTIONS]
         rows = (("rot", "Drehen:", rot_labels, "Was beim Drehen passiert (je Raste)."),
@@ -966,18 +1219,23 @@ class KnobDialog(tk.Toplevel):
                  "Knopf gedrückt halten und drehen – eine zweite Belegung, z. B. Ausgabegerät wechseln.\n"
                  "Das Loslassen danach zählt nicht als Drücken."),
                 ("press", "Kurz drücken:", press_labels, "Knopf kurz drücken und loslassen."),
-                ("long", "Lang drücken:", press_labels, "Knopf mindestens 0,6 Sekunden drücken, dann loslassen."))
+                ("long", "Lang drücken:", press_labels, "Knopf mindestens 1,5 Sekunden drücken (roter Rahmen am Deck), dann loslassen."),
+                ("double", "Doppelt drücken:", press_labels,
+                 "Zweimal schnell kurz drücken (innerhalb von 0,4 s). Ist hier etwas belegt, wartet ein einfacher "
+                 "Druck kurz, ob ein zweiter kommt."))
         for r, (key, text, values, help_text) in enumerate(rows):
-            tip(ttk.Label(right, text=text), help_text).grid(row=r, column=0, sticky="w", pady=2)
+            lab = tip(ttk.Label(right, text=text), help_text)
+            lab.grid(row=r, column=0, sticky="w", pady=2)
             v = tk.StringVar()
             cb = ttk.Combobox(right, textvariable=v, values=values, state="readonly", width=40)
             cb.grid(row=r, column=1, sticky="w", padx=(6, 0), pady=2)
             cb.bind("<<ComboboxSelected>>", lambda e: self._update())
             tip(cb, help_text)
             self.v[key] = v
+            self.main_rows.append((lab, cb))
 
         extra = ttk.LabelFrame(right, text="Einstellungen dazu", padding=8)
-        extra.grid(row=4, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        extra.grid(row=5, column=0, columnspan=2, sticky="we", pady=(10, 0))
         self.extra_rows = {}
 
         def row(name, label, widget_fn, help_text):
@@ -1015,7 +1273,8 @@ class KnobDialog(tk.Toplevel):
                                       ("keysp_left", "Gedrückt links:", "Tastenkürzel je Raste, gedrückt nach links."),
                                       ("keysp_right", "Gedrückt rechts:", "Tastenkürzel je Raste, gedrückt nach rechts."),
                                       ("keys_press", "Kurz drücken:", "Tastenkürzel beim kurzen Drücken."),
-                                      ("keys_long", "Lang drücken:", "Tastenkürzel beim langen Drücken.")):
+                                      ("keys_long", "Lang drücken:", "Tastenkürzel beim langen Drücken."),
+                                      ("keys_double", "Doppelt drücken:", "Tastenkürzel beim Doppeldruck.")):
             self.v[key] = tk.StringVar()
             row(key, "Tasten " + label, lambda m, k=key: ttk.Entry(m, textvariable=self.v[k], width=30),
                 help_text + "\nBeispiele: Strg+Plus, Bildab, Alt+Tab, Strg+K, Strg+C (Abfolge mit Komma).")
@@ -1026,7 +1285,8 @@ class KnobDialog(tk.Toplevel):
             "Diese Kachel wird per Drehen eingestellt, z. B. ein Bosch-Rollladen in 10-%-Schritten.\n"
             "Es stehen nur Kacheln zur Wahl, die sich drehen lassen.")
         tile_labels = ["(keine)"] + [t for _, t in self.tiles]
-        for key, label in (("tile_press", "Kachel kurz:"), ("tile_long", "Kachel lang:")):
+        for key, label in (("tile_press", "Kachel kurz:"), ("tile_long", "Kachel lang:"),
+                           ("tile_double", "Kachel doppelt:")):
             self.v[key] = tk.StringVar()
             row(key, label, lambda m, k=key: ttk.Combobox(m, textvariable=self.v[k], values=tile_labels,
                                                          state="readonly", width=40),
@@ -1034,10 +1294,8 @@ class KnobDialog(tk.Toplevel):
 
         b = ttk.Frame(f)
         b.pack(anchor="e", pady=(14, 0))
-        ttk.Button(b, text="Abbrechen", command=self.destroy).pack(side="left", padx=4)
-        ttk.Button(b, text="OK", command=self.ok).pack(side="left")
-        self.bind("<Escape>", lambda e: self.destroy())
-        self._fill_list("")
+        self._ok_buttons(b, apply)
+        self._load()
         TileDialog._place_over(self, parent)
         self.grab_set()
         self.wait_window()
@@ -1060,22 +1318,6 @@ class KnobDialog(tk.Toplevel):
                     out.append((f"{p}:{i}", f"Seite {p + 1}, Platz {i + 1}: {tile_label(t)}"))
         return out
 
-    def _app_candidates(self):
-        names = set()
-        for page in self.deck_cfg.get("pages", []):
-            for t in page:
-                if t and t.get("type", "launch") == "launch" and t.get("path", "").lower().endswith((".exe", ".lnk")):
-                    try:
-                        exe = winctl.target_exe(t, t["path"])
-                    except Exception:
-                        exe = None
-                    if exe:
-                        names.add(os.path.basename(exe).lower())
-        names.update(a.lower() for a in winctl.running_apps())
-        names -= {a.lower() for a in FOREGROUND_IGNORE} | {"pc-deck.exe", "python.exe", "pythonw.exe"}
-        names -= set(self.presets)
-        return sorted(names)
-
     def _help(self):
         messagebox.showinfo("Drehknopf – so funktioniert's", KNOB_HELP, parent=self)
 
@@ -1087,144 +1329,405 @@ class KnobDialog(tk.Toplevel):
     def _key_of(actions, label):
         return next((k for k, t in actions if t == label), "off")
 
-    # ---------------------------------------------------------- Liste
-    def _fill_list(self, select):
-        self.listbox.delete(0, "end")
-        self.keys = [""] + sorted(a for a in self.presets if a)
-        for k in self.keys:
-            self.listbox.insert("end", k if k else "Standard (alle anderen)")
-        idx = self.keys.index(select) if select in self.keys else 0
-        self.listbox.selection_set(idx)
-        self.current = None
-        self._on_select()
-
-    def _on_select(self, _e=None):
-        sel = self.listbox.curselection()
-        if not sel:
-            return
-        self._store()
-        self.current = self.keys[sel[0]]
-        p = knob.preset(self.presets[self.current])
+    def _load(self):
+        p = self.p
         self.v["rot"].set(self._label_of(knob.ROT_ACTIONS, p["rot"]))
         self.v["rotp"].set(self._label_of(knob.ROT_ACTIONS, p["rotp"]))
         self.v["press"].set(self._label_of(knob.PRESS_ACTIONS, p["press"]))
         self.v["long"].set(self._label_of(knob.PRESS_ACTIONS, p["long"]))
+        self.v["double"].set(self._label_of(knob.PRESS_ACTIONS, p["double"]))
         self.v["step"].set(int(p["step"]))
         self.v["app"].set(p["app"])
-        for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long"):
+        for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long", "keys_double"):
             self.v[k].set(p[k])
         names = dict(self.tiles)
-        for k in ("tile_press", "tile_long"):
+        for k in ("tile_press", "tile_long", "tile_double"):
             self.v[k].set(names.get(p[k], "(keine)"))
         self.v["tile_rot"].set(dict(self.rot_tiles).get(p.get("tile_rot", ""), "(keine)"))
         for dev_id, v in self.dev_vars.items():
             v.set(dev_id in (p.get("devices") or []))
-        self.del_btn.configure(state="normal" if self.current else "disabled")
         self._update()
 
     def _store(self):
-        """Felder ins Preset des gerade markierten Eintrags übernehmen."""
-        if self.current is None:
-            return
-        p = knob.preset(self.presets[self.current])
+        p = knob.preset(self.p)
         p.update(rot=self._key_of(knob.ROT_ACTIONS, self.v["rot"].get()),
                  rotp=self._key_of(knob.ROT_ACTIONS, self.v["rotp"].get()),
                  press=self._key_of(knob.PRESS_ACTIONS, self.v["press"].get()),
                  long=self._key_of(knob.PRESS_ACTIONS, self.v["long"].get()),
+                 double=self._key_of(knob.PRESS_ACTIONS, self.v["double"].get()),
                  step=int(self.v["step"].get()), app=self.v["app"].get().strip())
-        for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long"):
+        for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long", "keys_double"):
             p[k] = self.v[k].get().strip()
         by_label = {t: ref for ref, t in self.tiles}
-        for k in ("tile_press", "tile_long"):
+        for k in ("tile_press", "tile_long", "tile_double"):
             p[k] = by_label.get(self.v[k].get(), "")
         p["tile_rot"] = {t: ref for ref, t in self.rot_tiles}.get(self.v["tile_rot"].get(), "")
         p["devices"] = [i for i, v in self.dev_vars.items() if v.get()]
         p["devices_names"] = {d["id"]: d["name"] for d in self.devices if d["id"] in p["devices"]}
-        self.presets[self.current] = p
+        return p
+
+    @staticmethod
+    def _set_state(widgets, on):
+        for x in widgets:
+            try:
+                x.configure(state=("readonly" if isinstance(x, (ttk.Combobox, ttk.Spinbox)) else "normal")
+                            if on else "disabled")
+            except tk.TclError:
+                pass
 
     def _update(self):
-        """Nur die Zusatzfelder freigeben, die zur gewählten Belegung gehören."""
+        """Felder nur bei eigener Belegung; Zusatzfelder nur, wenn sie zur gewählten Aktion gehören."""
+        own = bool(self.v_own.get())
+        for lab, cb in self.main_rows:
+            lab.configure(foreground="" if own else DIM)
+            self._set_state([cb], own)
         rot = self._key_of(knob.ROT_ACTIONS, self.v["rot"].get())
         rotp = self._key_of(knob.ROT_ACTIONS, self.v["rotp"].get())
         press = self._key_of(knob.PRESS_ACTIONS, self.v["press"].get())
         long = self._key_of(knob.PRESS_ACTIONS, self.v["long"].get())
+        double = self._key_of(knob.PRESS_ACTIONS, self.v["double"].get())
         need = {"step": {"volume", "app_volume"} & {rot, rotp}, "app": "app_volume" in (rot, rotp),
-                "devices": "output" in (rot, rotp, press, long),
+                "devices": "output" in (rot, rotp, press, long, double),
                 "keys_left": rot == "keys", "keys_right": rot == "keys",
                 "keysp_left": rotp == "keys", "keysp_right": rotp == "keys",
-                "keys_press": press == "keys", "keys_long": long == "keys",
-                "tile_press": press == "tile", "tile_long": long == "tile", "tile_rot": "tile" in (rot, rotp)}
+                "keys_press": press == "keys", "keys_long": long == "keys", "keys_double": double == "keys",
+                "tile_press": press == "tile", "tile_long": long == "tile", "tile_double": double == "tile",
+                "tile_rot": "tile" in (rot, rotp)}
         for name, (lab, w) in self.extra_rows.items():
-            on = bool(need.get(name))
+            on = own and bool(need.get(name))
             lab.configure(foreground="" if on else DIM)
-            widgets = w.winfo_children() if name == "devices" else [w]
-            for x in widgets:
-                try:
-                    x.configure(state=("readonly" if isinstance(x, (ttk.Combobox, ttk.Spinbox)) else "normal")
-                                if on else "disabled")
-                except tk.TclError:
-                    pass
+            self._set_state(w.winfo_children() if name == "devices" else [w], on)
 
-    # ---------------------------------------------------------- Programme
-    def _add_app(self):
-        d = tk.Toplevel(self)
-        d.title("Preset für Programm")
-        d.transient(self)
-        d.resizable(False, False)
-        fr = ttk.Frame(d, padding=12)
-        fr.pack()
-        ttk.Label(fr, text="Programm auswählen oder Namen eintippen (z. B. Discord.exe):").pack(anchor="w")
-        v = tk.StringVar()
-        cb = ttk.Combobox(fr, textvariable=v, values=self._app_candidates(), width=40)
-        cb.pack(anchor="w", pady=(6, 0))
-        cb.focus_set()
-        res = {}
-
-        def ok(_e=None):
-            name = v.get().strip().strip('"').lower()
-            if name and not name.endswith(".exe"):
-                name += ".exe"
-            res["name"] = name
-            d.destroy()
-        bb = ttk.Frame(fr)
-        bb.pack(anchor="e", pady=(12, 0))
-        ttk.Button(bb, text="Abbrechen", command=d.destroy).pack(side="left", padx=4)
-        ttk.Button(bb, text="OK", command=ok).pack(side="left")
-        d.bind("<Return>", ok)
-        d.bind("<Escape>", lambda e: d.destroy())
-        TileDialog._place_over(d, self)
-        d.grab_set()
-        d.wait_window()
-        name = res.get("name")
-        if not name:
-            return
-        self._store()
-        if name not in self.presets:
-            self.presets[name] = knob.preset(self.presets[""])  # Start: wie Standard
-        self._fill_list(name)
-
-    def _del_app(self):
-        if not self.current:
-            return
-        self.presets.pop(self.current, None)
-        self.current = None
-        self._fill_list("")
-
-    def ok(self):
-        self._store()
-        for p in self.presets.values():
-            for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long"):
-                try:
-                    winkeys.parse_sequence(p.get(k, ""))
-                except Exception as e:
+    def _current(self, strict=False):
+        """Eigene Belegung (geprüft) bzw. False für Standard; None = Tastenkürzel ungültig."""
+        if not self.v_own.get():
+            return False
+        p = self._store()
+        for k in ("keys_left", "keys_right", "keysp_left", "keysp_right", "keys_press", "keys_long", "keys_double"):
+            try:
+                winkeys.parse_sequence(p.get(k, ""))
+            except Exception as e:
+                if strict:
                     messagebox.showerror("Drehknopf", f"Tastenkürzel nicht erkannt: {p[k]}\n\n{e}", parent=self)
-                    return
-        self.result = {"default": self.presets[""], "apps": {a: p for a, p in self.presets.items() if a}}
-        self.destroy()
+                return None
+        return p
+
+
+# ======================================================================= Design
+class DesignDialog(_OkCancel, _Pane):
+    """Design des Decks wählen und anpassen. Jedes Design (auch die festen) merkt sich seine eigenen Änderungen;
+    „Auf Standard zurücksetzen“ bringt das gewählte Design auf seine Werkseinstellung. Alles zeigt sich sofort in
+    der Mitte, Hintergrund und Farben kurz danach auch am Deck; OK speichert, Abbrechen stellt den alten Stand her."""
+
+    EDITABLE = ("standard", "red", "green", "mono", "custom")
+
+    def __init__(self, win, select=None):
+        super().__init__(win)
+        self.win = win
+        self.title(f"Design – {win.cfg.get('name', '')}")
+        self.cfg0 = copy.deepcopy(win.cfg)
+        self.work = {}  # Design -> bearbeitete Werte (nur angefasste Designs)
+        self._loading = False
+        link = win.manager.link(win.deck_id)
+        # Vorschau am Deck nur, wenn sich der alte Stand wiederherstellen lässt (nicht bei „Auf dem Deck lassen“)
+        self._deck_fn = link.request_theme_preview if link and theme.settings(win.cfg) is not None else None
+        self._deck_after = None
+        self._deck_sent = None
+
+        f = ttk.Frame(self)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Design des Decks:").pack(anchor="w")
+        self.v = tk.StringVar(value=select or theme.design_id(win.cfg))
+        self._orig = theme.design_id(win.cfg)
+        for i, name in theme.CHOICES:
+            ttk.Radiobutton(f, text=name, value=i, variable=self.v, command=self._picked).pack(anchor="w", pady=1)
+        self.cur = self.v.get()
+
+        self.none_lbl = ttk.Label(f, foreground=DIM, wraplength=360, justify="left")
+        self.ed = ttk.Frame(f)
+        self.v_image = tk.StringVar()
+        self.v_auto = tk.BooleanVar()
+        self.tile_color = "#0a1b4b"
+        self.v_sat = tk.IntVar()
+        self.v_style = tk.StringVar()
+        self.v_bri = tk.IntVar()
+        self.v_alpha = tk.IntVar()
+        self.v_ibri = tk.IntVar()
+        self.v_icon_con = tk.IntVar()
+        self.v_isat = tk.IntVar()
+        self.v_itint = tk.BooleanVar()
+        self.tint_color = theme.ICON_DEFAULT["icon_tint_color"]
+        self.v_iamt = tk.IntVar()
+        self.ed_title = ttk.Label(self.ed, font=("Segoe UI Semibold", 10))
+        self.ed_title.pack(anchor="w")
+        ttk.Label(self.ed, text="Bild:").pack(anchor="w", pady=(8, 0))
+        ttk.Entry(self.ed, textvariable=self.v_image, width=40).pack(fill="x")
+        ttk.Button(self.ed, text="Bild wählen ...", command=self.pick_image).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(self.ed, text="Kachelfarbe automatisch aus dem Bild", variable=self.v_auto).pack(
+            anchor="w", pady=(10, 0))
+        self._scale(self.ed, "Farbstärke:", self.v_sat, 0, 100)
+        self.color_btn = tk.Button(self.ed, text="Eigene Farbe ...", command=self.pick_color, relief="flat",
+                                   padx=10, pady=3)
+        self.color_btn.pack(anchor="w", pady=(6, 0))
+        ttk.Label(self.ed, text="Kachel-Stil:").pack(anchor="w", pady=(10, 0))
+        ttk.Combobox(self.ed, state="readonly", textvariable=self.v_style, width=30,
+                     values=[n for _, n in theme.STYLES]).pack(anchor="w")
+        self._scale(self.ed, "Hintergrund-Helligkeit:", self.v_bri, 10, 70, pad=10)
+        self._scale(self.ed, "Kachel-Deckkraft:", self.v_alpha, 40, 100)
+        ttk.Label(self.ed, text="Icons (alle Kacheln)", font=("Segoe UI Semibold", 10)).pack(anchor="w", pady=(16, 0))
+        self._scale(self.ed, "Helligkeit:", self.v_ibri, -50, 50)
+        self._scale(self.ed, "Kontrast:", self.v_icon_con, 50, 150)
+        self._scale(self.ed, "Farbe:", self.v_isat, 0, 200)
+        tr = ttk.Frame(self.ed)
+        tr.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(tr, text="Einfärben", variable=self.v_itint).pack(side="left")
+        self.tint_btn = tk.Button(tr, text="Farbe ...", command=self.pick_tint, relief="flat", padx=10, pady=2)
+        self.tint_btn.pack(side="left", padx=(10, 0))
+        self._scale(self.ed, "Stärke:", self.v_iamt, 0, 100)
+        self.reset_btn = tip(ttk.Button(self.ed, text="Auf Standard zurücksetzen", command=self.reset),
+                             "Dieses Design auf seine Werkseinstellung zurücksetzen (gilt nach OK).")
+        self.reset_btn.pack(anchor="w", pady=(14, 0))
+
+        self.hint = ttk.Label(f, foreground=DIM, wraplength=360, justify="left",
+                              text="Die Mitte zeigt jede Änderung sofort" + (", das Deck Hintergrund und Farben kurz "
+                                   "danach" if self._deck_fn else "") + ". Icons ändern sich am Deck nach OK. "
+                                   "Jedes Design merkt sich seine eigenen Einstellungen.")
+        self.btns = ttk.Frame(f)
+        self._ok_buttons(self.btns, lambda cur: self._save())
+        for v in (self.v_image, self.v_auto, self.v_sat, self.v_style, self.v_bri, self.v_alpha, self.v_ibri,
+                  self.v_icon_con, self.v_isat, self.v_itint, self.v_iamt):
+            v.trace_add("write", self._edited)
+        self._load(self.cur)
+        if select:
+            self._preview()
+
+    @staticmethod
+    def _scale(parent, text, var, lo, hi, pad=6):
+        r = ttk.Frame(parent)
+        r.pack(fill="x", pady=(pad, 0))
+        ttk.Label(r, text=text, width=22).pack(side="left")
+        ttk.Scale(r, from_=lo, to=hi, variable=var).pack(side="left", fill="x", expand=True)
+
+    # ---------------------------------------------------------- Werte
+    def _values_of(self, d):
+        return copy.deepcopy(self.work[d]) if d in self.work else theme.design_values(self.win.cfg, d)
+
+    def _load(self, d):
+        """Einstellungen des Designs d ins Formular (bzw. Hinweis bei „Auf dem Deck lassen“/„Kein Design“)."""
+        self.cur = d
+        for w in (self.ed, self.none_lbl, self.hint, self.btns):
+            w.pack_forget()
+        if d in self.EDITABLE:
+            t = self._values_of(d)
+            self._loading = True
+            self.v_image.set(t.get("image", ""))
+            self.v_auto.set(not str(t.get("tile", "auto")).startswith("#"))
+            self.tile_color = t.get("tile") if str(t.get("tile", "")).startswith("#") else "#0a1b4b"
+            self.v_sat.set(int(t.get("tile_sat", 75)))
+            self.v_style.set(dict(theme.STYLES).get(t.get("style", "glass"), "Glas (Verlauf + Glanz)"))
+            self.v_bri.set(int(t.get("bg_brightness", 30)))
+            self.v_alpha.set(int(t.get("tile_alpha", 80)))
+            self.v_ibri.set(int(t.get("icon_bri", 0)))
+            self.v_icon_con.set(int(t.get("icon_con", 100)))
+            self.v_isat.set(int(t.get("icon_sat", 100)))
+            self.v_itint.set(bool(t.get("icon_tint")))
+            self.tint_color = t.get("icon_tint_color") or theme.ICON_DEFAULT["icon_tint_color"]
+            self.v_iamt.set(int(t.get("icon_tint_amt", 50)))
+            self._loading = False
+            self.ed_title.configure(text=f"Einstellungen „{dict(theme.CHOICES)[d]}“")
+            self.ed.pack(fill="x", pady=(12, 0))
+            self._colors()
+        else:
+            self.none_lbl.configure(text="„Auf dem Deck lassen“ ändert nichts am Deck (z. B. Deck von einem "
+                                    "anderen PC). Die Mitte zeigt weiter das gespeicherte Design." if d == "keep" else
+                                    "Ohne Design: dunkler Hintergrund, einfarbige Kacheln, kein Startbild.")
+            self.none_lbl.pack(anchor="w", pady=(12, 0))
+        self.hint.pack(anchor="w", pady=(12, 0))
+        self.btns.pack(anchor="e", pady=(12, 0))
+
+    def _form(self):
+        """Werte aus dem Formular (auf die Werte des Designs gelegt, z. B. bleibt „mono“ erhalten)."""
+        t = self._values_of(self.cur)
+        style = next((k for k, n in theme.STYLES if n == self.v_style.get()), "glass")
+        t.update({"enabled": True, "image": self.v_image.get().strip().strip('"'),
+                  "tile": "auto" if self.v_auto.get() else self.tile_color, "tile_sat": int(self.v_sat.get()),
+                  "style": style, "bg_brightness": int(self.v_bri.get()), "tile_alpha": int(self.v_alpha.get()),
+                  "icon_bri": int(self.v_ibri.get()), "icon_con": int(self.v_icon_con.get()),
+                  "icon_sat": int(self.v_isat.get()), "icon_tint": bool(self.v_itint.get()),
+                  "icon_tint_color": self.tint_color, "icon_tint_amt": int(self.v_iamt.get())})
+        return t
+
+    def _edited(self, *_):
+        if self._loading or self.cur not in self.EDITABLE:
+            return
+        self.work[self.cur] = self._form()
+        self._colors()
+        self._preview()
+
+    def _colors(self):
+        self.color_btn.configure(bg=self.tile_color, fg="#ffffff", activebackground=self.tile_color,
+                                 state="disabled" if self.v_auto.get() else "normal")
+        self.tint_btn.configure(bg=self.tint_color, fg="#ffffff", activebackground=self.tint_color,
+                                state="normal" if self.v_itint.get() else "disabled")
+
+    def _cfg_with(self):
+        """Konfiguration mit allen Änderungen dieses Fensters und dem gewählten Design."""
+        c = copy.deepcopy(self.win.cfg)
+        for d, vals in self.work.items():
+            c = theme.with_design(c, d, vals)
+        c["design"] = self.v.get()
+        return c
+
+    # ---------------------------------------------------------- Vorschau
+    def _picked(self):
+        self._load(self.v.get())
+        self._preview()
+
+    def _preview(self):
+        """Sofort in der Mitte; am Deck 0,4 s nach der letzten Änderung (ohne Startbild und Icons)."""
+        c = self._cfg_with()
+        self.win.design_preview(None if c["design"] == "keep" else c)
+        if self._deck_fn and c["design"] != "keep":
+            if self._deck_after:
+                self.after_cancel(self._deck_after)
+            self._deck_after = self.after(400, self._send_deck)
+
+    def _send_deck(self):
+        self._deck_after = None
+        t = theme.settings(self._cfg_with())
+        if t is not None and t != self._deck_sent:
+            self._deck_sent = t
+            self._deck_fn(t)
+
+    def _ended(self, ok):
+        if self._deck_after:
+            self.after_cancel(self._deck_after)
+            self._deck_after = None
+        if self._deck_sent is not None and not ok:
+            self._deck_fn(None)  # Abbrechen: Deck zeigt wieder das gespeicherte Design
+            self._deck_sent = None
+
+    # ---------------------------------------------------------- Aktionen
+    def reset(self):
+        if self.cur in self.EDITABLE:
+            self.work[self.cur] = theme.base_settings(self.cur)
+            self._load(self.cur)
+            self._preview()
+
+    def pick_image(self):
+        cur = self.v_image.get()
+        start = os.path.dirname(cur) if os.path.isdir(os.path.dirname(cur)) else theme.WALLPAPER_DIR
+        p = filedialog.askopenfilename(parent=self, title="Hintergrundbild wählen", initialdir=start,
+                                       filetypes=[("Bilder", "*.jpg *.jpeg *.png *.bmp"), ("Alle", "*.*")])
+        if p:
+            self.v_image.set(os.path.normpath(p))
+
+    def pick_color(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(color=self.tile_color, parent=self, title="Kachelfarbe")[1]
+        if c:
+            self.tile_color = c
+            self._edited()
+
+    def pick_tint(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(color=self.tint_color, parent=self, title="Farbe zum Einfärben der Icons")[1]
+        if c:
+            self.tint_color = c
+            self._edited()
+
+    def _current(self, strict=False):
+        return self.v.get()
+
+    def changed(self):
+        if self.v.get() != self._orig:
+            return True
+        return any(vals != theme.design_values(self.cfg0, d) for d, vals in self.work.items())
+
+    def _save(self):
+        c = self._cfg_with()
+        for k in ("design", "design_mods", "theme"):
+            if k in c:
+                self.win.cfg[k] = c[k]
+            else:
+                self.win.cfg.pop(k, None)
+        self.win.v_design.set(dict(theme.CHOICES)[c["design"]])
+        self.win._commit("design", "design_mods", "theme")
+
+
+# ======================================================================= Anzeige-Dialog
+class DisplayDialog(_OkCancel, _Pane):
+    """Anzeige am Deck (ab FW 27): Kacheln nacheinander aufbauen, Dimmen bei Nichtbenutzung, Uhr im Ruhebild."""
+
+    def __init__(self, parent, opts, fw, apply):
+        super().__init__(parent)
+        self.title(f"Anzeige – {parent.cfg.get('name', '')}")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.v_build = tk.BooleanVar(value=bool(opts["build"]))
+        self.v_dim = tk.BooleanVar(value=bool(opts["dim"]))
+        self.v_min = tk.IntVar(value=int(opts["dim_min"]))
+        self.v_pct = tk.IntVar(value=int(opts["dim_pct"]))
+        self.v_clock = tk.BooleanVar(value=bool(opts["clock"]))
+        self.v_world = tk.BooleanVar(value=bool(opts["clock_world"]))
+        self.v_walkers = tk.BooleanVar(value=bool(opts["walkers"]))
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        if fw is not None and fw < 27:
+            ttk.Label(f, foreground="#c05000", wraplength=360, justify="left",
+                      text=f"Das Deck hat Firmware {fwfile.label(fw)}. Diese Einstellungen wirken erst ab Firmware 1.027 "
+                           "(„Firmware ...“ im Hauptfenster).").pack(anchor="w", pady=(0, 8))
+        tip(ttk.Checkbutton(f, text="Kacheln beim Seitenwechsel nacheinander aufbauen", variable=self.v_build),
+            "Nur ein Effekt: Die Seite ist fertig gerechnet und wird Kachel für Kachel gezeigt.\n"
+            "Decks ohne PSRAM (Deck 2) bauen ohnehin so auf.").pack(anchor="w")
+        tip(ttk.Checkbutton(f, text="Display dimmen, wenn es nicht benutzt wird", variable=self.v_dim),
+            "Nach der eingestellten Zeit ohne Tipper oder Drehknopf wird das Display dunkler.\n"
+            "Der erste Tipper weckt nur auf (löst nichts aus), der Drehknopf wirkt sofort.\n"
+            "Ein Seitenwechsel durch die Automatik weckt das Display ebenfalls.").pack(anchor="w", pady=(8, 0))
+        row = ttk.Frame(f)
+        row.pack(anchor="w", padx=(22, 0), pady=(2, 0))
+        ttk.Label(row, text="nach").pack(side="left")
+        ttk.Spinbox(row, from_=1, to=240, width=4, textvariable=self.v_min).pack(side="left", padx=4)
+        ttk.Label(row, text="Minuten auf").pack(side="left")
+        ttk.Spinbox(row, from_=1, to=100, width=4, textvariable=self.v_pct).pack(side="left", padx=4)
+        ttk.Label(row, text="% Helligkeit").pack(side="left")
+        tip(ttk.Checkbutton(f, text="Uhr im Ruhebild", variable=self.v_clock),
+            "Ist die App nicht verbunden (PC gesperrt, Standby, Neustart), zeigt das Deck Uhrzeit und Datum "
+            "statt des Logos.\nNach einem Stromausfall erst wieder, wenn die App verbunden war.").pack(
+            anchor="w", pady=(8, 0))
+        st = ttk.Frame(f)
+        st.pack(anchor="w", padx=(22, 0), pady=(2, 0))
+        tip(ttk.Radiobutton(st, text="Block-Welt", variable=self.v_world, value=True),
+            "Landschaft aus Blöcken, Himmel nach Tageszeit, Sonne und Mond wandern über den Himmel "
+            "(ab Firmware 1.031).").pack(side="left")
+        ttk.Radiobutton(st, text="Schlicht", variable=self.v_world, value=False).pack(side="left", padx=(12, 0))
+        tip(ttk.Checkbutton(f, text="Figuren laufen vorbei", variable=self.v_walkers),
+            "In der Block-Welt läuft alle paar Minuten eine Figur über das Gras: tagsüber ein Wanderer, "
+            "nachts ein Zombie, ein Skelett oder eine Spinne. Ganz selten kämpfen eine Riesenechse und ein "
+            "Riesenaffe (ab Firmware 1.035; zum Ausprobieren 5x schnell auf die Uhr tippen).").pack(
+                anchor="w", padx=(22, 0), pady=(2, 0))
+        b = ttk.Frame(f)
+        b.pack(anchor="e", pady=(14, 0))
+        self._ok_buttons(b, apply)
+        TileDialog._place_over(self, parent)
+        self.grab_set()
+        self.wait_window()
+
+    def _current(self, strict=False):
+        try:
+            m, p = int(self.v_min.get()), int(self.v_pct.get())
+        except (tk.TclError, ValueError):
+            if strict:
+                messagebox.showerror("Anzeige", "Bitte Minuten und Prozent als Zahl eingeben.", parent=self)
+            return None
+        return {"build": bool(self.v_build.get()), "dim": bool(self.v_dim.get()), "dim_min": max(1, min(240, m)),
+                "dim_pct": max(1, min(100, p)), "clock": bool(self.v_clock.get()),
+                "clock_world": bool(self.v_world.get()), "walkers": bool(self.v_walkers.get())}
 
 
 # ======================================================================= WLAN-Dialog
-class WifiDialog(tk.Toplevel):
+class WifiDialog(_Pane):
     """WLAN des Decks einrichten und koppeln (nur per USB), Status anzeigen, ein-/ausschalten."""
 
     def __init__(self, parent, manager, config_store, deck_id):
@@ -1243,33 +1746,35 @@ class WifiDialog(tk.Toplevel):
         f.pack(fill="both", expand=True)
         via = "nicht verbunden" if not link else (f"über {link.port}" if link.via_wlan else f"über USB ({link.port})")
         ttk.Label(f, text=f"Deck: {via}").grid(row=0, column=0, columnspan=3, sticky="w")
-        self.status = ttk.Label(f, text="WLAN-Status wird abgefragt ..." if link else "")
+        self.status = ttk.Label(f, text="WLAN-Status wird abgefragt ..." if link else "", wraplength=360,
+                                justify="left")
         self.status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
 
-        tip(ttk.Label(f, text="Netz:"), "Das WLAN, mit dem sich das Deck verbinden soll.").grid(row=2, column=0,
-                                                                                            sticky="w")
+        f.columnconfigure(0, weight=1)
+        net = ttk.Frame(f)
+        net.grid(row=2, column=0, columnspan=3, sticky="we")
+        tip(ttk.Label(net, text="Netz:"), "Das WLAN, mit dem sich das Deck verbinden soll.").pack(anchor="w")
         self.v_net = tk.StringVar()
-        self.net_box = ttk.Combobox(f, textvariable=self.v_net, width=36)
-        self.net_box.grid(row=2, column=1, sticky="w", padx=6)
+        self.net_box = ttk.Combobox(net, textvariable=self.v_net, width=30)
+        self.net_box.pack(fill="x")
         tip(self.net_box, "Auswählen oder Namen eintippen (auch für versteckte Netze). Das Deck kann nur "
                           "2,4-GHz-Netze nutzen.")
-        self.scan_btn = tip(ttk.Button(f, text="Netze suchen", command=self.scan),
+        self.scan_btn = tip(ttk.Button(net, text="Netze suchen", command=self.scan),
                             "Das Deck sucht die WLANs in seiner Nähe (dauert ein paar Sekunden).")
-        self.scan_btn.grid(row=2, column=2, sticky="w")
+        self.scan_btn.pack(anchor="w", pady=(4, 0))
 
-        tip(ttk.Label(f, text="Passwort:"), "WLAN-Passwort – tippst du selbst ein.").grid(row=3, column=0,
-                                                                                       sticky="w", pady=(6, 0))
+        tip(ttk.Label(net, text="Passwort:"), "WLAN-Passwort – tippst du selbst ein.").pack(anchor="w", pady=(8, 0))
         self.v_pw = tk.StringVar()
-        self.pw_entry = ttk.Entry(f, textvariable=self.v_pw, width=38, show="•")
-        self.pw_entry.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
+        self.pw_entry = ttk.Entry(net, textvariable=self.v_pw, width=30, show="•")
+        self.pw_entry.pack(fill="x")
         tip(self.pw_entry, "Das Passwort wird nur an das Deck geschickt und dort gespeichert – "
                            "die App speichert es nicht.")
         self.v_show = tk.BooleanVar()
-        ttk.Checkbutton(f, text="anzeigen", variable=self.v_show,
-                        command=lambda: self.pw_entry.configure(show="" if self.v_show.get() else "•")).grid(
-            row=3, column=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(net, text="Passwort anzeigen", variable=self.v_show,
+                        command=lambda: self.pw_entry.configure(show="" if self.v_show.get() else "•")).pack(
+            anchor="w", pady=(4, 0))
 
-        ttk.Label(f, foreground=DIM, justify="left", wraplength=470,
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=360,
                   text="Verbinden & koppeln: Das Deck speichert WLAN und Passwort und bekommt einen geheimen "
                        "Schlüssel von dieser App. Am USB ist das WLAN aus (Strom, Wärme) – nach dem Einrichten "
                        "bleibt es noch 30 s an. Ohne USB (Netzteil, Powerbank) fragt das Deck „WLAN "
@@ -1277,7 +1782,8 @@ class WifiDialog(tk.Toplevel):
                        "anderen PC mit PC-Deck, werden WLAN und Kopplung im Deck gelöscht.").grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
         if link and not usb:
-            ttk.Label(f, foreground="#c05000", text="Einrichten, Koppeln und Ein-/Ausschalten geht nur, "
+            ttk.Label(f, foreground="#c05000", wraplength=360, justify="left",
+                      text="Einrichten, Koppeln und Ein-/Ausschalten geht nur, "
                       "wenn das Deck per USB angesteckt ist.").grid(row=5, column=0, columnspan=3, sticky="w",
                                                                    pady=(6, 0))
 
@@ -1292,7 +1798,9 @@ class WifiDialog(tk.Toplevel):
         self.on_btn = tip(ttk.Button(b, text="WLAN ein", command=lambda: self.enable(True)),
                           "WLAN am Deck wieder einschalten (mit den gespeicherten Einstellungen).")
         self.on_btn.pack(side="left", padx=4)
-        ttk.Button(b, text="Schließen", command=self.destroy).pack(side="left", padx=(12, 0))
+        b2 = ttk.Frame(f)
+        b2.grid(row=7, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(b2, text="Schließen", command=self.destroy).pack(side="left")
         for w in (self.connect_btn, self.off_btn, self.on_btn):
             w.configure(state="normal" if usb else "disabled")
         if not link:
@@ -1426,7 +1934,7 @@ class WifiDialog(tk.Toplevel):
 
 
 # ======================================================================= Smart-Home-Dialog
-class BoschDialog(tk.Toplevel):
+class BoschDialog(_Pane):
     """Bosch Smart Home Controller suchen und koppeln; Geräte für die SmartHome-Seite dieses Decks anhaken."""
 
     def __init__(self, parent):
@@ -1442,26 +1950,30 @@ class BoschDialog(tk.Toplevel):
 
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
-        self.status = ttk.Label(f, text="", wraplength=500, justify="left")
+        self.status = ttk.Label(f, text="", wraplength=360, justify="left")
         self.status.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
-        tip(ttk.Label(f, text="Controller:"), "IP-Adresse des Bosch Smart Home Controllers im Heimnetz.").grid(
-            row=1, column=0, sticky="w")
+        f.columnconfigure(0, weight=1)
+        conn = ttk.Frame(f)
+        conn.grid(row=1, column=0, columnspan=3, sticky="we")
+        tip(ttk.Label(conn, text="Controller (IP-Adresse):"),
+            "IP-Adresse des Bosch Smart Home Controllers im Heimnetz.").pack(anchor="w")
+        hr = ttk.Frame(conn)
+        hr.pack(fill="x")
         self.v_host = tk.StringVar(value=boschshc.settings().get("host", ""))
-        ttk.Entry(f, textvariable=self.v_host, width=20).grid(row=1, column=1, sticky="w", padx=6)
-        self.search_btn = tip(ttk.Button(f, text="Suchen", command=self.search),
+        ttk.Entry(hr, textvariable=self.v_host, width=20).pack(side="left", fill="x", expand=True)
+        self.search_btn = tip(ttk.Button(hr, text="Suchen", command=self.search),
                               "Sucht den Controller im eigenen Netz (dauert ein paar Sekunden).")
-        self.search_btn.grid(row=1, column=2, sticky="w")
+        self.search_btn.pack(side="left", padx=(6, 0))
 
-        tip(ttk.Label(f, text="Systempasswort:"), "Das Passwort des Controllers aus der Einrichtung – "
-                                                  "tippst du selbst ein.").grid(row=2, column=0, sticky="w",
-                                                                                pady=(6, 0))
+        tip(ttk.Label(conn, text="Systempasswort:"), "Das Passwort des Controllers aus der Einrichtung – "
+                                                     "tippst du selbst ein.").pack(anchor="w", pady=(8, 0))
         self.v_pw = tk.StringVar()
-        self.pw_entry = ttk.Entry(f, textvariable=self.v_pw, width=30, show="•")
-        self.pw_entry.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+        self.pw_entry = ttk.Entry(conn, textvariable=self.v_pw, width=30, show="•")
+        self.pw_entry.pack(fill="x")
         tip(self.pw_entry, "Wird nur zum Koppeln an den Controller geschickt und nicht gespeichert.")
 
-        ttk.Label(f, foreground=DIM, justify="left", wraplength=500,
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=360,
                   text="Koppeln: 1. Controller suchen (oder IP eintragen), 2. Systempasswort eintippen, "
                        "3. die Taste am Controller drücken, bis die LEDs blinken, 4. gleich danach "
                        "„Koppeln“. Die App meldet sich dann mit einem eigenen Zertifikat an (im Controller als "
@@ -1488,10 +2000,14 @@ class BoschDialog(tk.Toplevel):
                               "Kopplung in PC-Deck vergessen. Den Eintrag „OSS PC-Deck“ im Controller "
                               "kannst du in der Bosch-App löschen.")
         self.unpair_btn.pack(side="left", padx=4)
-        ttk.Button(b, text="Schließen", command=self.close).pack(side="left", padx=(12, 0))
+        b2 = ttk.Frame(f)
+        b2.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(b2, text="Abbrechen", command=self.cancel).pack(side="left", padx=4)
+        tip(ttk.Button(b2, text="OK", style="Accent.TButton", command=self.close),
+            "Angehakte Geräte übernehmen und sofort ans Deck senden.").pack(side="left")
 
-        self.protocol("WM_DELETE_WINDOW", self.close)
-        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.bind("<Escape>", lambda e: self.cancel())
         TileDialog._place_over(self, parent)
         self._refresh()
         self.after(100, self._poll)
@@ -1624,9 +2140,14 @@ class BoschDialog(tk.Toplevel):
         self._save_selection()
         self.destroy()
 
+    def cancel(self):
+        """Geräteauswahl verwerfen (Koppeln/Entkoppeln gilt schon, das lässt sich nicht abbrechen)."""
+        self.v_pw.set("")
+        self.destroy()
+
 
 # ======================================================================= Soundboard-Dialog
-class SoundboardDialog(tk.Toplevel):
+class SoundboardDialog(_Pane):
     """Sounds für die Seite „Soundboard“ dieses Decks anhaken (Sound-Ordner), gemeinsame Einstellungen.
     Neu heruntergeladene Sounds werden sofort angehakt; Jack Black ist von Anfang an dabei."""
 
@@ -1646,19 +2167,20 @@ class SoundboardDialog(tk.Toplevel):
             sb["sounds"] = [soundsearch.target_path(n, u) for n, u in soundsearch.DEFAULT_SOUNDS]
         self.checked = list(sb["sounds"])
         self.colors = dict(sb.get("colors") or {})  # pfad -> Farbname (fehlt = automatisch)
+        self.volumes = dict(sb.get("volumes") or {})  # pfad -> Lautstärke in % (fehlt = 50)
         self._dots = {}
 
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
-        ttk.Label(f, foreground=DIM, wraplength=520, justify="left",
+        ttk.Label(f, foreground=DIM, wraplength=360, justify="left",
                   text="Angehakte Sounds erscheinen auf der Seite „Soundboard“ am Ende dieses Decks (vorne die "
                        "Kachel „Alle stoppen“). Antippen spielt, nochmal antippen stoppt. Klick auf einen Eintrag "
-                       "hakt ihn an oder ab, Rechtsklick wählt die Farbe des Knopfs (sonst automatisch der Reihe "
-                       "nach).").pack(fill="x")
+                       "hakt ihn an oder ab, Rechtsklick wählt Farbe des Knopfs (sonst automatisch der Reihe "
+                       f"nach) und Lautstärke des Sounds (Standard {SOUND_VOLUME_DEFAULT} %).").pack(fill="x")
         mid = ttk.Frame(f)
         mid.pack(fill="both", expand=True, pady=(8, 0))
         self.tree = ttk.Treeview(mid, columns=("file",), show="tree", height=12, selectmode="none")
-        self.tree.column("#0", width=500)
+        self.tree.column("#0", width=340)
         sb_ = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb_.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -1669,36 +2191,38 @@ class SoundboardDialog(tk.Toplevel):
         bt = ttk.Frame(f)
         bt.pack(fill="x", pady=(6, 0))
         ttk.Button(bt, text="Sounds suchen ...", command=self.search).pack(side="left")
-        ttk.Button(bt, text="Sound-Ordner öffnen", command=self.open_folder).pack(side="left", padx=4)
-        ttk.Button(bt, text="Liste aktualisieren", command=self.fill).pack(side="left")
-        ttk.Button(bt, text="▶ / ■", width=6, command=self.listen).pack(side="left", padx=(12, 0))
+        ttk.Button(bt, text="▶ / ■", width=6, command=self.listen).pack(side="left", padx=4)
+        bt2 = ttk.Frame(f)
+        bt2.pack(fill="x", pady=(4, 0))
+        ttk.Button(bt2, text="Sound-Ordner öffnen", command=self.open_folder).pack(side="left")
+        ttk.Button(bt2, text="Liste aktualisieren", command=self.fill).pack(side="left", padx=4)
 
         opt = ttk.LabelFrame(f, text="Für alle Soundboard-Kacheln", padding=8)
         opt.pack(fill="x", pady=(10, 0))
         self.v = {}
-        rows = (("volume", "Lautstärke:", sound_plugin.VOLUMES, "100", 12),
-                ("device", "Ausgabegerät:", sound_plugin._out_choices(), "", 46),
-                ("device2", "Zweites Gerät (Discord & Co.):", sound_plugin._out2_choices(), "", 46),
-                ("mode", "Wenn schon ein Sound läuft:", sound_plugin.MODES, "overlay", 46))
+        rows = (("device", "Ausgabegerät:", sound_plugin._out_choices(), "", 40),
+                ("device2", "Zweites Gerät (Discord & Co.):", sound_plugin._out2_choices(), "", 40),
+                ("mode", "Wenn schon ein Sound läuft:", sound_plugin.MODES, "overlay", 40))
         self.maps = {}
         for r, (key, label, choices, default, width) in enumerate(rows):
-            ttk.Label(opt, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Label(opt, text=label).grid(row=2 * r, column=0, sticky="w", pady=(4, 0))
             cur = sb.get(key, default)
             if cur not in {v for v, _ in choices}:
                 choices = choices + [(cur, f"{cur} (nicht verbunden)")]
             self.maps[key] = {lbl: v for v, lbl in choices}
             var = tk.StringVar(value=next(lbl for v, lbl in choices if v == cur))
             ttk.Combobox(opt, textvariable=var, state="readonly", width=width,
-                         values=[lbl for _, lbl in choices]).grid(row=r, column=1, sticky="w", padx=(6, 0), pady=2)
+                         values=[lbl for _, lbl in choices]).grid(row=2 * r + 1, column=0, sticky="w")
             self.v[key] = var
-        ttk.Label(opt, text=sound_plugin._cable_hint(), foreground=DIM, wraplength=480, justify="left").grid(
-            row=len(rows), column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(opt, text=sound_plugin._cable_hint(), foreground=DIM, wraplength=360, justify="left").grid(
+            row=2 * len(rows), column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         b = ttk.Frame(f)
         b.pack(fill="x", pady=(12, 0))
-        ttk.Button(b, text="Schließen", command=self.close).pack(side="right")
-        self.protocol("WM_DELETE_WINDOW", self.close)
-        self.bind("<Escape>", lambda e: self.close())
+        tip(ttk.Button(b, text="OK", command=self.close), "Übernehmen und sofort ans Deck senden.").pack(side="right")
+        ttk.Button(b, text="Abbrechen", command=self.cancel).pack(side="right", padx=4)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.bind("<Escape>", lambda e: self.cancel())
         TileDialog._place_over(self, parent)
         self.fill()
         self.grab_set()
@@ -1712,8 +2236,12 @@ class SoundboardDialog(tk.Toplevel):
         on = [p for p in self.checked if os.path.isfile(p)]
         for p in on + [p for p in files if p not in self.checked]:
             mark = self.CHECK if p in self.checked else self.EMPTY
-            self.tree.insert("", "end", iid=p, text=f"{mark}  {os.path.splitext(os.path.basename(p))[0]}",
+            name = os.path.splitext(os.path.basename(p))[0]
+            self.tree.insert("", "end", iid=p, text=f"{mark}  {name}   ({self._volume(p)} %)",
                              image=self._dot(self._color(p, on)))
+
+    def _volume(self, p):
+        return self.volumes.get(p, SOUND_VOLUME_DEFAULT)
 
     def _color(self, p, on):
         """Knopffarbe wie auf dem Deck: fest gewählt oder automatisch nach der Reihenfolge; nicht angehakt = grau."""
@@ -1737,12 +2265,28 @@ class SoundboardDialog(tk.Toplevel):
         if not p:
             return
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label="automatisch", command=lambda: self._set_color(p, ""))
-        m.add_separator()
+        mc = tk.Menu(m, tearoff=0)
+        mc.add_command(label="automatisch", command=lambda: self._set_color(p, ""))
+        mc.add_separator()
         for name, hexcol in self.sp.PALETTE:
-            m.add_command(label=name, image=self._dot(hexcol), compound="left",
-                          command=lambda n=name: self._set_color(p, n))
+            mc.add_command(label=name, image=self._dot(hexcol), compound="left",
+                           command=lambda n=name: self._set_color(p, n))
+        m.add_cascade(label="Farbe", menu=mc)
+        mv = tk.Menu(m, tearoff=0)
+        cur = self._volume(p)
+        for v, label in self.sp.VOLUMES:
+            mv.add_command(label=("• " if v == cur else "   ") + label, command=lambda v=v: self._set_volume(p, v))
+        m.add_cascade(label=f"Lautstärke ({cur} %)", menu=mv)
         m.tk_popup(ev.x_root, ev.y_root)
+
+    def _set_volume(self, p, v):
+        if v == SOUND_VOLUME_DEFAULT:
+            self.volumes.pop(p, None)
+        else:
+            self.volumes[p] = v
+        y = self.tree.yview()[0]
+        self.fill()
+        self.tree.yview_moveto(y)
 
     def _set_color(self, p, name):
         if name:
@@ -1777,7 +2321,7 @@ class SoundboardDialog(tk.Toplevel):
             return
         try:
             with open(p, "rb") as fh:
-                soundplayer.preview(fh.read())
+                soundplayer.preview(fh.read(), volume=int(self._volume(p)) / 100)
         except Exception as e:
             messagebox.showerror("PC-Deck", f"Abspielen fehlgeschlagen:\n{e}", parent=self)
 
@@ -1787,17 +2331,24 @@ class SoundboardDialog(tk.Toplevel):
                 self.checked.append(path)
             if self.winfo_exists():
                 self.fill()
-        SoundSearchDialog(self, on_download=downloaded)
+        SoundSearchDialog(self.winfo_toplevel(), on_download=downloaded)
 
     def open_folder(self):
         os.makedirs(self.ss.SOUND_DIR, exist_ok=True)
         os.startfile(self.ss.SOUND_DIR)
+
+    def cancel(self):
+        """Nichts übernehmen (heruntergeladene Dateien bleiben im Sound-Ordner)."""
+        import soundplayer
+        soundplayer.stop(soundplayer.PREVIEW)
+        self.destroy()
 
     def close(self):
         import soundplayer
         soundplayer.stop(soundplayer.PREVIEW)
         sb = {"sounds": [p for p in self.checked if os.path.isfile(p)]}
         sb["colors"] = {p: c for p, c in self.colors.items() if p in sb["sounds"]}
+        sb["volumes"] = {p: v for p, v in self.volumes.items() if os.path.isfile(p)}
         for key, var in self.v.items():
             sb[key] = self.maps[key].get(var.get(), "")
         if sb != self.win.cfg.get("soundboard"):
@@ -1813,15 +2364,16 @@ class SoundboardDialog(tk.Toplevel):
 
 
 # ======================================================================= Firmware-Dialog
-class FirmwareDialog(tk.Toplevel):
+class FirmwareDialog(_Pane):
     """Firmware des Decks über die bestehende USB-Verbindung aktualisieren (ab FW 16)."""
 
-    def __init__(self, parent, manager, deck_id):
+    def __init__(self, parent, manager, deck_id, auto=False):
         super().__init__(parent)
         self.title("Firmware des Decks")
         self.transient(parent)
         self.resizable(False, False)
         self.manager, self.deck_id = manager, deck_id
+        self.auto = auto  # nach der Abfrage: mitgelieferte Firmware ohne weitere Nachfrage aufspielen
         self.results = queue.Queue()
         self.busy = False
         self.deck_type, self.slot = None, 0
@@ -1831,16 +2383,18 @@ class FirmwareDialog(tk.Toplevel):
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
         via = "nicht verbunden" if not link else (f"über {link.port}" if link.via_wlan else f"über USB ({link.port})")
-        self.deck_lbl = ttk.Label(f, text=f"Deck: Firmware {link.fw if link else '?'}, {via}")
+        f.columnconfigure(0, weight=1)
+        self.deck_lbl = ttk.Label(f, text=f"Deck: Firmware {fwfile.label(link.fw) if link else '?'}, {via}", wraplength=360,
+                                  justify="left")
         self.deck_lbl.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.bundle_lbl = ttk.Label(f, text="")
+        self.bundle_lbl = ttk.Label(f, text="", wraplength=360, justify="left")
         self.bundle_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        self.bar = ttk.Progressbar(f, length=440, maximum=1000)
+        self.bar = ttk.Progressbar(f, length=200, maximum=1000)
         self.bar.grid(row=2, column=0, columnspan=2, sticky="we", pady=(12, 4))
-        self.status = ttk.Label(f, text="", wraplength=440, justify="left")
+        self.status = ttk.Label(f, text="", wraplength=360, justify="left")
         self.status.grid(row=3, column=0, columnspan=2, sticky="w")
-        ttk.Label(f, foreground=DIM, justify="left", wraplength=440,
-                  text="Die neue Firmware wird über USB (ab Firmware 18 auch über WLAN) übertragen und in den "
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=360,
+                  text="Die neue Firmware wird über USB (ab Firmware 1.018 auch über WLAN) übertragen und in den "
                        "zweiten Programm-Platz "
                        "des Decks geschrieben. Erst wenn alles vollständig und die Prüfsumme richtig ist, startet "
                        "das Deck mit ihr neu – bei einem Abbruch läuft die alte Firmware einfach weiter. Kacheln, "
@@ -1856,8 +2410,10 @@ class FirmwareDialog(tk.Toplevel):
                             "Eine andere PC-Deck-Firmware (.bin) aufspielen, z. B. eine selbst gebaute "
                             "(.pio\\build\\<env>\\firmware.bin). Der Deck-Typ muss passen.")
         self.file_btn.pack(side="left", padx=4)
-        self.close_btn = ttk.Button(b, text="Schließen", command=self.close)
-        self.close_btn.pack(side="left", padx=(12, 0))
+        b2 = ttk.Frame(f)
+        b2.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        self.close_btn = ttk.Button(b2, text="Schließen", command=self.close)
+        self.close_btn.pack(side="left")
         for w in (self.bundle_btn, self.file_btn):
             w.configure(state="disabled")
 
@@ -1868,10 +2424,10 @@ class FirmwareDialog(tk.Toplevel):
         if not link:
             self.status.configure(text="Das Deck ist nicht verbunden.")
         elif link.fw < 16:
-            self.status.configure(text=f"Das Deck hat Firmware {link.fw}. Das Update aus der App geht erst ab "
-                                       "Firmware 16 – einmalig per USB mit PlatformIO aufspielen (siehe Anleitung).")
+            self.status.configure(text=f"Das Deck hat Firmware {fwfile.label(link.fw)}. Das Update aus der App geht erst ab "
+                                       "Firmware 1.016 – einmalig per USB mit PlatformIO aufspielen (siehe Anleitung).")
         elif link.via_wlan and link.fw < 18:
-            self.status.configure(text=f"Das Deck hat Firmware {link.fw}. Update über WLAN geht erst ab Firmware 18 – "
+            self.status.configure(text=f"Das Deck hat Firmware {fwfile.label(link.fw)}. Update über WLAN geht erst ab Firmware 1.018 – "
                                        "dieses eine Mal per USB anstecken.")
         else:
             self.status.configure(text="Deck wird abgefragt ...")
@@ -1899,15 +2455,18 @@ class FirmwareDialog(tk.Toplevel):
             return
         self.deck_type, self.slot = parts[2], int(parts[3])
         link = self.manager.link(self.deck_id)
-        self.deck_lbl.configure(text=f"Deck: Firmware {parts[1]}, {fwfile.type_name(self.deck_type)}, "
+        self.deck_lbl.configure(text=f"Deck: Firmware {fwfile.label(parts[1])}, {fwfile.type_name(self.deck_type)}, "
                                      f"über USB ({link.port if link else '?'})")
         b = self.bundled.get(self.deck_type)
-        self.bundle_lbl.configure(text=f"Mitgeliefert: Firmware {b[0]}" if b else
+        self.bundle_lbl.configure(text=f"Mitgeliefert: Firmware {fwfile.label(b[0])}" if b else
                                   "Mitgeliefert: keine Firmware für diesen Deck-Typ")
         self.bundle_btn.configure(state="normal" if b else "disabled")
         self.file_btn.configure(state="normal")
         self.status.configure(text="Bereit." if not b or b[0] > int(parts[1]) else
                               "Das Deck ist schon auf dem Stand der mitgelieferten Firmware.")
+        if self.auto and b and b[0] > int(parts[1]):
+            self.auto = False
+            self._flash(b[1], confirm=False)
 
     def flash_bundled(self):
         self._flash(self.bundled[self.deck_type][1])
@@ -1918,7 +2477,7 @@ class FirmwareDialog(tk.Toplevel):
         if path:
             self._flash(path)
 
-    def _flash(self, path):
+    def _flash(self, path, confirm=True):
         link = self.manager.link(self.deck_id)
         try:
             with open(path, "rb") as fh:
@@ -1928,7 +2487,7 @@ class FirmwareDialog(tk.Toplevel):
             return
         inf = fwfile.info(data)
         if not inf:
-            messagebox.showerror("PC-Deck", "Das ist keine PC-Deck-Firmware (ab Firmware 16).", parent=self)
+            messagebox.showerror("PC-Deck", "Das ist keine PC-Deck-Firmware (ab Firmware 1.016).", parent=self)
             return
         if inf[1] != self.deck_type:
             messagebox.showerror("PC-Deck", f"Die Datei ist für {fwfile.type_name(inf[1])}, das Deck ist "
@@ -1938,16 +2497,16 @@ class FirmwareDialog(tk.Toplevel):
             messagebox.showerror("PC-Deck", "Die Firmware ist zu groß für den Programm-Platz des Decks.", parent=self)
             return
         if not link or (link.via_wlan and link.fw < 18):
-            messagebox.showerror("PC-Deck", "Das Deck ist nicht per USB verbunden (über WLAN erst ab Firmware 18).",
+            messagebox.showerror("PC-Deck", "Das Deck ist nicht per USB verbunden (über WLAN erst ab Firmware 1.018).",
                                  parent=self)
             return
         if inf[0] <= link.fw and not messagebox.askyesno(
-                "PC-Deck", f"Das Deck hat schon Firmware {link.fw}, die Datei ist Firmware {inf[0]}. "
+                "PC-Deck", f"Das Deck hat schon Firmware {fwfile.label(link.fw)}, die Datei ist Firmware {fwfile.label(inf[0])}. "
                            "Trotzdem aufspielen?", parent=self):
             return
         hint = ("Deck während der Übertragung eingeschaltet und im WLAN lassen." if link.via_wlan else
                 "USB-Kabel während der Übertragung nicht abziehen.")
-        if not messagebox.askyesno("PC-Deck", f"Firmware {inf[0]} ({len(data):,} Byte) jetzt aufspielen?".replace(",", ".")
+        if confirm and not messagebox.askyesno("PC-Deck", f"Firmware {fwfile.label(inf[0])} ({len(data):,} Byte) jetzt aufspielen?".replace(",", ".")
                                    + "\n\n" + hint, parent=self):
             return
         self.busy = True
@@ -1979,7 +2538,6 @@ class FirmwareDialog(tk.Toplevel):
 
 # ======================================================================= Hauptfenster
 class ConfigWindow(tk.Toplevel):
-    TILE_W, TILE_H = 120, 100
 
     def __init__(self, root, config, manager, deck_id=None):
         super().__init__(root)
@@ -1991,6 +2549,7 @@ class ConfigWindow(tk.Toplevel):
         self.photos = []
         self.clipboard = None
         self.dirty = False
+        self._save_after = None  # gebündeltes Speichern nach einer Änderung (_mark_dirty)
         self.page = 0
 
         ids = self._deck_ids()
@@ -2019,119 +2578,197 @@ class ConfigWindow(tk.Toplevel):
         state = "verbunden" if did in self.manager.connected() else "nicht verbunden"
         return f"{d.get('name', did)}  ({state}, ID {did})"
 
-    def _build(self):
-        top = ttk.Frame(self, padding=(10, 8))
-        top.pack(fill="x")
+    def _nav(self, parent, text, cmd, tip_text, key=None):
+        b = tip(ttk.Button(parent, text=text, style="Nav.TButton", command=cmd), tip_text)
+        b.pack(fill="x", pady=1)
+        if key:
+            self.nav_buttons[key] = b
+        return b
 
-        ttk.Label(top, text="Deck:").pack(side="left")
-        self.deck_box = ttk.Combobox(top, state="readonly", width=46)
-        self.deck_box.pack(side="left", padx=4)
+    def _build(self):
+        apply_theme(self)
+        self.configure(bg=C["bg"])
+        self.nav_buttons = {}
+        head = ttk.Frame(self, style="Panel.TFrame", padding=(14, 8))
+        head.pack(fill="x")
+        ttk.Label(head, text="PC-Deck", style="Head.TLabel").pack(side="left")
+        self.status = ttk.Label(head, text="", style="PanelDim.TLabel")
+        self.status.pack(side="right")
+
+        self.paned = ttk.PanedWindow(self, orient="horizontal")
+        self.paned.pack(fill="both", expand=True)
+
+        # ---- links: Deck und Bereiche (scrollt bei Bedarf)
+        self.nav_scroll = AutoScroll(self.paned, horizontal=False)
+        nav = ttk.Frame(self.nav_scroll.inner, style="Panel.TFrame", padding=(8, 10))
+        nav.pack(fill="both", expand=True)
+        self.deck_box = ttk.Combobox(nav, state="readonly", width=24)
+        self.deck_box.pack(fill="x", padx=2, pady=(0, 4))
         self.deck_box.bind("<<ComboboxSelected>>", self.on_deck_selected)
         tip(self.deck_box, "Welches Deck du bearbeitest. Jedes Deck (erkannt an seiner Chip-ID) hat ein eigenes "
-                           "Layout, Design und eine eigene Drehknopf-Belegung.")
-        tip(ttk.Button(top, text="Umbenennen", command=self.rename_deck),
-            "Namen des Decks ändern (nur hier in der App sichtbar).").pack(side="left", padx=2)
-        tip(ttk.Button(top, text="Entfernen", command=self.remove_deck),
+                           "Layout und Design.")
+        dr = ttk.Frame(nav, style="Panel.TFrame")
+        dr.pack(fill="x", pady=(0, 10))
+        tip(ttk.Button(dr, text="Umbenennen", command=self.rename_deck),
+            "Namen des Decks ändern (Name im Netzwerk: PC-Deck-<Name>).").pack(side="left", padx=2)
+        tip(ttk.Button(dr, text="Entfernen", command=self.remove_deck),
             "Deck samt Layout aus der Konfiguration löschen. Steckst du es wieder an, "
             "erscheint es leer neu.").pack(side="left", padx=2)
-
-        tip(ttk.Label(top, text="Helligkeit:"), "Hintergrundbeleuchtung des Displays. "
-            "Wird beim Loslassen des Reglers sofort am Deck übernommen.").pack(side="left", padx=(16, 2))
+        self._nav(nav, "▦   Kacheln", lambda: None, "Kacheln dieses Decks: anklicken zum Bearbeiten, "
+                  "Programme und Ordner aus dem Explorer draufziehen.", "tiles")
+        self.nav_buttons["tiles"].configure(style="NavOn.TButton")
+        self.auto_btn = self._nav(nav, "⟳   Automatik", self.edit_auto,
+                                  "Kommt eines der eingetragenen Programme in den Vordergrund, zeigt das Deck "
+                                  "die angezeigte Seite. Verlässt du es, springt das Deck zurück.", "auto")
+        self._nav(nav, "♫   Soundboard", self.edit_soundboard,
+                  "Sounds anhaken: daraus entsteht die Seite „Soundboard“ am Ende des Decks.", "sound")
+        self._nav(nav, "⌂   SmartHome", self.edit_smarthome,
+                  "Bosch Smart Home Controller koppeln: Kacheln für Rollladen und Licht.", "home")
+        ttk.Label(nav, text="Deck", style="PanelDim.TLabel").pack(anchor="w", padx=10, pady=(14, 2))
+        self._nav(nav, "◐   Design", self.edit_design, "Aussehen des Decks: fertige Designs oder eigenes.",
+                  "design")
+        self._nav(nav, "☀   Anzeige", self.edit_display,
+                  "Kacheln nacheinander aufbauen, dimmen bei Nichtbenutzung, Uhr im Ruhebild.", "display")
+        self._nav(nav, "≋   WLAN", self.edit_wifi, "Deck per WLAN anbinden (einmal per USB einrichten).", "wifi")
+        self._nav(nav, "⬆   Firmware", self.edit_firmware, "Firmware des Decks aktualisieren.", "fw")
+        self._nav(nav, "✛   Touch kalibrieren", self.calibrate,
+                  "Am Deck die Ecken der Reihe nach antippen, wenn Tipper an der falschen Stelle ankommen.",
+                  "touch")
+        bot = ttk.Frame(nav, style="Panel.TFrame")
+        bot.pack(fill="x", pady=(18, 0))
+        ttk.Label(bot, text="Helligkeit", style="PanelDim.TLabel").pack(anchor="w", padx=10)
         self.v_bri = tk.IntVar()
-        s = ttk.Scale(top, from_=10, to=255, variable=self.v_bri, length=120, command=lambda v: self._mark_dirty())
-        s.pack(side="left")
-        s.bind("<ButtonRelease-1>", lambda e: self._live_brightness())
-
-        tip(ttk.Label(top, text="Design:"), "Aussehen des Decks: Startbild (auch ohne Verbindung), Hintergrund "
-            "und Kachelfarben. Das Design bleibt im Deck gespeichert – auch an einem anderen PC.").pack(
-            side="left", padx=(16, 2))
+        sc = ttk.Scale(bot, from_=10, to=255, variable=self.v_bri)
+        sc.pack(fill="x", padx=10, pady=(2, 10))
+        sc.bind("<ButtonRelease-1>", lambda e: self._live_brightness())
+        tip(sc, "Hintergrundbeleuchtung des Displays – gilt beim Loslassen sofort.")
+        self._nav(bot, "?   Hilfe", self.show_help, "Kurze Anleitung zu Deck, Kacheln und Drehknopf", "help")
         self.v_design = tk.StringVar()
-        self.design_box = ttk.Combobox(top, textvariable=self.v_design, state="readonly", width=20,
-                                       values=[n for _, n in theme.CHOICES])
-        self.design_box.pack(side="left")
-        self.design_box.bind("<<ComboboxSelected>>", self.on_design)
-        tip(self.design_box, "Standard, Rot/Magenta, Grün und Schwarz/Weiß sind feste Designs.\n"
-            "„Eigenes Design“ stellst du mit „Eigenes ...“ selbst zusammen.\n"
-            "„Auf dem Deck lassen“ ändert nichts am Deck (z. B. Deck von einem anderen PC).\n"
-            "Bei Schwarz/Weiß werden auch alle Icons grau – auch neu hinzugefügte.")
-        tip(ttk.Button(top, text="Eigenes ...", command=self.edit_theme),
-            "Eigenes Design gestalten: Bild, Kachelfarbe, Stil, Helligkeit und Deckkraft – mit Vorschau.").pack(
-            side="left", padx=(4, 2))
 
-        row2 = ttk.Frame(self, padding=(10, 0, 10, 8))
-        row2.pack(fill="x")
-        tip(ttk.Label(row2, text="Spalten:"), "Kacheln nebeneinander (2–5). Beim Verkleinern werden Kacheln "
-            "nur ausgeblendet und kommen beim Vergrößern zurück.").pack(side="left")
-        self.v_cols = tk.IntVar()
-        ttk.Spinbox(row2, from_=COLS_RANGE[0], to=COLS_RANGE[1], width=3, textvariable=self.v_cols,
-                    command=self.on_grid_changed, state="readonly").pack(side="left", padx=(2, 10))
-        tip(ttk.Label(row2, text="Zeilen:"), "Kacheln untereinander (1–3).").pack(side="left")
-        self.v_rows = tk.IntVar()
-        ttk.Spinbox(row2, from_=ROWS_RANGE[0], to=ROWS_RANGE[1], width=3, textvariable=self.v_rows,
-                    command=self.on_grid_changed, state="readonly").pack(side="left", padx=(2, 20))
+        # ---- rechts: Kachel-Eigenschaften und Bereiche (Breite mit dem Trenner einstellbar)
+        self.side_scroll = AutoScroll(self.paned, horizontal=True)
+        self.side = self.side_scroll.inner
+        self.editor = None
+        self.selected = None
+        self.pane = None           # Inhalt eines Bereichs (Automatik, Soundboard ...) im rechten Feld
+        self.pane_key = None
+        self._clearing = False
+        self._design_override = None  # Vorschau eines angeklickten Designs im Abbild
 
-        ttk.Button(row2, text="◀", width=3, command=lambda: self.goto_page(-1)).pack(side="left")
-        self.page_label = ttk.Label(row2, width=12, anchor="center")
+        # ---- Mitte: Werkzeuge, Abbild des Decks (wächst mit dem Fenster)
+        mid = ttk.Frame(self.paned, padding=(18, 12))
+        self.mid = mid
+        self.paned.add(self.nav_scroll, weight=0)
+        self.paned.add(mid, weight=1)
+        self.paned.add(self.side_scroll, weight=0)
+        self.scale = 1.5
+        self._base = None
+        tools = ttk.Frame(mid)
+        tools.pack(fill="x", pady=(0, 10))
+        ttk.Button(tools, text="◀", width=3, command=lambda: self.goto_page(-1)).pack(side="left")
+        self.page_label = ttk.Label(tools, width=12, anchor="center")
         self.page_label.pack(side="left")
-        ttk.Button(row2, text="▶", width=3, command=lambda: self.goto_page(1)).pack(side="left")
-        tip(ttk.Button(row2, text="+ Seite", command=self.add_page),
-            "Neue leere Seite anhängen (bis zu 8). Am Deck blätterst du unten mit < und >.").pack(
-            side="left", padx=(10, 2))
-        tip(ttk.Button(row2, text="Seite löschen", command=self.del_page),
+        ttk.Button(tools, text="▶", width=3, command=lambda: self.goto_page(1)).pack(side="left")
+        tip(ttk.Button(tools, text="+ Seite", command=self.add_page),
+            "Neue leere Seite hinter der angezeigten (bis zu 8).").pack(side="left", padx=(12, 2))
+        tip(ttk.Button(tools, text="Seite löschen", command=self.del_page),
             "Die angezeigte Seite mit allen Kacheln löschen.").pack(side="left", padx=2)
-        self.auto_btn = ttk.Button(row2, text="Automatik ...", command=self.edit_auto)
-        self.auto_btn.pack(side="left", padx=(10, 2))
-        tip(self.auto_btn, "Automatik: Kommt eines der hier eingetragenen Programme in den Vordergrund, "
-            "zeigt das Deck diese Seite. Verlässt du es, springt das Deck zurück.")
-        tip(ttk.Button(row2, text="Drehknopf ...", command=self.edit_knob),
-            "Belegung des Drehknopfs: Drehen, gedrückt drehen, kurz und lang drücken – "
-            "als Standard und je Programm (z. B. Discord, Edge).").pack(side="left", padx=(10, 2))
+        row2 = ttk.Frame(mid)
+        row2.pack(fill="x", pady=(0, 10))
+        self.tools2 = row2
+        tip(ttk.Label(row2, text="Raster"), "Spalten × Zeilen. Beim Verkleinern werden Kacheln nur "
+            "ausgeblendet und kommen beim Vergrößern zurück.").pack(side="left", padx=(0, 4))
+        self.v_cols = tk.IntVar()
+        self.sp_cols = ttk.Spinbox(row2, from_=COLS_RANGE[0], to=COLS_RANGE[1], width=3, textvariable=self.v_cols,
+                                   command=self.on_grid_changed, state="readonly")
+        self.sp_cols.pack(side="left", padx=2)
+        tip(ttk.Label(row2, text="×"), "Zeilen (1–3, Big-Deck 1–4)").pack(side="left")
+        self.v_rows = tk.IntVar()
+        self.sp_rows = ttk.Spinbox(row2, from_=ROWS_RANGE[0], to=ROWS_RANGE[1], width=3, textvariable=self.v_rows,
+                                   command=self.on_grid_changed, state="readonly")
+        self.sp_rows.pack(side="left", padx=(2, 18))
         self.v_suggest = tk.BooleanVar(value=True)
         tip(ttk.Checkbutton(row2, text="Plus-Kachel", variable=self.v_suggest, command=self.on_suggest),
             "Das Programm im Vordergrund erscheint blass mit „+“ auf dem ersten freien Platz. "
-            "Antippen am Deck speichert es dort als Kachel.").pack(side="left", padx=(10, 2))
+            "Antippen am Deck speichert es dort als Kachel.").pack(side="left")
 
-        self.grid_frame = tk.Frame(self, bg=BG, padx=10, pady=10)
-        self.grid_frame.pack()
+        self.hint_lbl = ttk.Label(mid, foreground=DIM, wraplength=600, justify="center")
+        self.hint_lbl.pack(side="bottom", pady=(10, 0))
+        frame = tk.Frame(mid, bg="#0b0b0b", padx=8, pady=8)  # schwarzer Displayrand
+        frame.pack(anchor="n")
+        self.tools = tools
+        self.canvas = tk.Label(frame, bd=0, bg="#000000", cursor="hand2")
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Button-3>", self._on_right_click)
+        if HAVE_DND:
+            self.canvas.drop_target_register(DND_FILES)
+            self.canvas.dnd_bind("<<Drop>>", self._on_canvas_drop)
+        self.hint_lbl.configure(text="Programme, Verknüpfungen oder Ordner aus dem Explorer auf eine Kachel "
+                                     "ziehen • Klick = bearbeiten • Rechtsklick = kopieren, einfügen, leeren")
+        mid.bind("<Configure>", lambda e: self._fit_later())
+        self._show_side_hint()
+        self._live_tick()
+        self._restore_layout()
 
-        hint = ("Programme, Verknüpfungen oder Ordner aus dem Explorer auf eine Kachel ziehen, "
-                "oder Kachel anklicken. Rechtsklick: kopieren / einfügen / leeren.") if HAVE_DND else \
-               ("Kachel anklicken zum Bearbeiten. Rechtsklick: kopieren / einfügen / leeren.  "
-                "(Für Drag & Drop: pip install tkinterdnd2)")
-        tk.Label(self, text=hint, bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(pady=(0, 6))
+    # ---------------------------------------------------------- Größe, Trenner, Abbild skalieren
+    def _restore_layout(self):
+        """Fenstergröße und Breite des rechten Felds wie beim letzten Mal."""
+        ui = self.config_store.data.get("ui") or {}
+        self.minsize(960, 600)
+        self.geometry(ui.get("geometry") or "1500x880")
+        self._side_w = int(ui.get("side_w", 520))
+        self.after(150, self._apply_sash)
+        self.paned.bind("<ButtonRelease-1>", lambda e: self._remember_layout(), add="+")
 
-        bottom = ttk.Frame(self, padding=(10, 4, 10, 10))
-        bottom.pack(fill="x")
-        self.status = ttk.Label(bottom, text="")
-        self.status.pack(side="left")
-        ttk.Button(bottom, text="Schließen", command=self.close).pack(side="right")
-        tip(ttk.Button(bottom, text="?", width=3, command=lambda: messagebox.showinfo(
-            "PC-Deck – so funktioniert's",
-            APP_HELP + f"\n\nPC-Deck {VERSION}   •   Einstellungen und Protokoll: {APP_DIR}", parent=self)), "Kurze Anleitung zu Deck, Kacheln und Drehknopf").pack(
-            side="right", padx=(0, 6))
-        tip(ttk.Button(bottom, text="Speichern & ans Deck senden", command=self.save),
-            "Änderungen speichern. Kacheln, Icons und Design werden nur übertragen, wenn sie sich "
-            "geändert haben; die Drehknopf-Belegung gilt sofort.").pack(side="right", padx=6)
-        tip(ttk.Button(bottom, text="Soundboard ...", command=self.edit_soundboard),
-            "Sounds anhaken: daraus entsteht die Seite „Soundboard“ am Ende des Decks. Neue Sounds direkt "
-            "suchen, probehören und herunterladen.").pack(side="right", padx=6)
-        tip(ttk.Button(bottom, text="Smart Home ...", command=self.edit_smarthome),
-            "Bosch Smart Home Controller koppeln: danach gibt es Kacheln für Rollladen und Licht "
-            "(Kachel-Typ „Bosch Smart Home“).").pack(side="right", padx=6)
-        tip(ttk.Button(bottom, text="Firmware ...", command=self.edit_firmware),
-            "Firmware des Decks über das USB-Kabel aktualisieren (ab Firmware 16) – mitgeliefert oder "
-            "eigene .bin-Datei.").pack(side="right", padx=6)
-        tip(ttk.Button(bottom, text="WLAN ...", command=self.edit_wifi),
-            "Deck optional per WLAN anbinden: einmal per USB einrichten und koppeln, danach findet die App "
-            "das Deck im WLAN, sobald es nicht per USB steckt.").pack(side="right", padx=6)
-        tip(ttk.Button(bottom, text="Touch kalibrieren", command=self.calibrate),
-            "Am Deck erscheinen nacheinander Markierungen in den Ecken – jeweils genau antippen. "
-            "Hilft, wenn Tipper an der falschen Stelle ankommen.").pack(side="right", padx=6)
+    def _apply_sash(self):
+        total = self.paned.winfo_width()
+        if total < 300:
+            self.after(100, self._apply_sash)
+            return
+        nav_w = max(self.nav_scroll.inner.winfo_reqwidth(), 190)
+        try:
+            self.paned.sashpos(0, nav_w)
+            self.paned.sashpos(1, max(nav_w + 300, total - self._side_w))
+        except tk.TclError:
+            pass
+
+    def _remember_layout(self):
+        try:
+            self._side_w = self.paned.winfo_width() - self.paned.sashpos(1)
+        except tk.TclError:
+            return
+        with self.config_store.lock:
+            self.config_store.data["ui"] = {"geometry": self.geometry(), "side_w": int(self._side_w)}
+        self._fit_later()
+
+    def _fit_later(self):
+        if getattr(self, "_fit_after", None):
+            self.after_cancel(self._fit_after)
+        self._fit_after = self.after(60, self._fit)
+
+    def _fit(self):
+        """Abbild so groß wie der Platz in der Mitte erlaubt (ganzes Display, Seitenverhältnis 3:2)."""
+        self._fit_after = None
+        if not self.winfo_exists():
+            return
+        w = self.mid.winfo_width() - 36 - 16
+        h = (self.mid.winfo_height() - 24 - 16 - self.tools.winfo_reqheight() - 10 - self.tools2.winfo_reqheight()
+             - 10 - self.hint_lbl.winfo_reqheight() - 10)
+        self.hint_lbl.configure(wraplength=max(200, w))
+        dw, dh = deckview.size(self.cfg)
+        sc = max(0.4 * deckview.W / dw, min(w / dw, h / dh))
+        if abs(sc - self.scale) > 0.01:
+            self.scale = sc
+            self._show_image()
 
     def _load_deck_ui(self):
         ids = self._deck_ids()
         self.deck_box["values"] = [self._deck_title(i) for i in ids]
         self.deck_box.current(ids.index(self.deck_id))
+        (c0, c1), (r0, r1) = grid_ranges(self.cfg)  # Big-Deck: bis 6 x 4
+        self.sp_cols.configure(from_=c0, to=c1)
+        self.sp_rows.configure(from_=r0, to=r1)
         self.v_cols.set(self.cfg["cols"])
         self.v_rows.set(self.cfg["rows"])
         self.v_bri.set(self.cfg.get("brightness", 200))
@@ -2140,6 +2777,8 @@ class ConfigWindow(tk.Toplevel):
         self.page = min(self.page, len(self.cfg["pages"]) - 1)
         self.dirty = False
         self.render()
+        self._fit_later()  # anderes Deck: evtl. andere Displaygröße (Big-Deck)
+        self.after(400, lambda: self.winfo_exists() and self._knob_orphans())  # alte Belegungen ohne Kachel?
 
     def refresh_status(self):
         """Wird von außen aufgerufen, wenn Decks kommen oder gehen."""
@@ -2151,58 +2790,255 @@ class ConfigWindow(tk.Toplevel):
             self.deck_box.current(ids.index(self.deck_id))
 
     # ---------------------------------------------------------- Raster zeichnen
+    def _view_cfg(self):
+        """Konfiguration so, wie das Deck sie zeigt (mit Soundboard-/SmartHome-Seiten)."""
+        return add_extra_pages(copy.deepcopy(self.cfg))
+
     def render(self):
-        for w in self.grid_frame.winfo_children():
-            w.destroy()
-        self.photos.clear()
-        cols, rows = self.cfg["cols"], self.cfg["rows"]
-        page = self.cfg["pages"][self.page]
-        for i in range(cols * rows):
-            t = page[i]
-            cell = tk.Frame(self.grid_frame, width=self.TILE_W, height=self.TILE_H, bg=BG)
-            cell.grid(row=i // cols, column=i % cols, padx=4, pady=4)
-            cell.pack_propagate(False)
-            if t:
-                text = tile_label(t)
-                if t.get("text_only"):
-                    btn = tk.Label(cell, text=text, bg=TILE, fg=TEXT, font=("Segoe UI", 10), wraplength=self.TILE_W - 10)
-                else:
-                    photo = _icon_photo(t)
-                    self.photos.append(photo)
-                    btn = tk.Label(cell, image=photo, text=text, compound="top", bg=TILE, fg=TEXT,
-                                   font=("Segoe UI", 9))
-            else:
-                btn = tk.Label(cell, text="+", bg="#1c1e24", fg=DIM, font=("Segoe UI", 20))
-            btn.pack(fill="both", expand=True)
-            tip(btn, TILE_TIP if t else "Leerer Platz: anklicken oder ein Programm, eine Verknüpfung "
-                "oder einen Ordner aus dem Explorer hierher ziehen.")
-            btn.bind("<Button-1>", lambda e, i=i: self.edit_tile(i))
-            btn.bind("<Button-3>", lambda e, i=i: self.context_menu(e, i))
-            if HAVE_DND:
-                btn.drop_target_register(DND_FILES)
-                btn.dnd_bind("<<Drop>>", lambda e, i=i: self.on_drop(e, i))
-        self.page_label.configure(text=f"Seite {self.page + 1} / {len(self.cfg['pages'])}")
-        n = len(auto_apps(self.cfg)[self.page])
-        self.auto_btn.configure(text=f"Automatik ({n}) ..." if n else "Automatik ...")
+        view = self._view_cfg()
+        if self._design_override is not None:  # Design-Bereich: Vorschau der Einstellungen
+            view = add_extra_pages(copy.deepcopy(self._design_override))
+        link = self.manager.link(self.deck_id)
+        live = {}
+        if link and link.visible_page == self.page:
+            live = {i: v for (p, i), v in dict(getattr(link, "live_view", {})).items() if p == self.page}
+        title = (view.get("page_titles") or {}).get(self.page)
+        self._base = deckview.render(view, self.page, live=live, title=title, selected=self.selected,
+                                     accent=C["accent_rgb"], volume=getattr(link, "vol_sent", None))
+        self._show_image()
+        self.page_label.configure(text=f"Seite {self.page + 1} / {len(view['pages'])}")
+        n = len(auto_apps(self.cfg)[self.page]) if self._own() else 0
+        self.auto_btn.configure(text=f"⟳   Automatik ({n})" if n else "⟳   Automatik")
         self._update_status()
+
+    def _show_image(self):
+        if self._base is None:
+            return
+        sc = self.scale
+        bw, bh = self._base.size
+        self._photo = ImageTk.PhotoImage(self._base.resize((int(bw * sc), int(bh * sc)), Image.LANCZOS))
+        self.canvas.configure(image=self._photo)
+
+    def _live_tick(self):
+        """Live-Kacheln (Uhr, Lautstärke ...) im Abbild nachführen, wenn das Deck dieselbe Seite zeigt."""
+        if not self.winfo_exists():
+            return
+        link = self.manager.link(self.deck_id)
+        ver = (getattr(link, "live_version", 0), link.visible_page, link.vol_sent) if link else None
+        if ver != getattr(self, "_live_ver", None):
+            self._live_ver = ver
+            if link and link.visible_page == self.page:
+                self.render()
+        self.after(1500, self._live_tick)
+
+    def _slot_from_event(self, x, y):
+        i = deckview.slot_at(self._view_cfg(), x / self.scale, y / self.scale)
+        if i is not None and i >= 0 and not self._own():
+            self._extra_info()
+            return None
+        return i
+
+    def _on_click(self, ev):
+        i = self._slot_from_event(ev.x, ev.y)
+        if i == -1:
+            self.goto_page(-1)
+        elif i == -2:
+            self.goto_page(1)
+        elif i is not None:
+            self.select_tile(i)
+
+    def _on_right_click(self, ev):
+        i = self._slot_from_event(ev.x, ev.y)
+        if i is not None and i >= 0:
+            self.context_menu(ev, i)
+
+    def _on_canvas_drop(self, ev):
+        px, py = self.canvas.winfo_pointerxy()
+        i = self._slot_from_event(px - self.canvas.winfo_rootx(), py - self.canvas.winfo_rooty())
+        if i is not None and i >= 0:
+            self.on_drop(ev, i)
+
+    # ---------------------------------------------------------- Kachel-Eigenschaften (rechts)
+    def _clear_side(self):
+        self._clearing = True
+        try:
+            for w in self.side.winfo_children():
+                w.destroy()
+        finally:
+            self._clearing = False
+        self.editor = None
+        self.pane = None
+        self.pane_key = None
+        self._design_override = None
+        self.side_scroll.top()
+
+    def _set_nav(self, key):
+        for k, b in self.nav_buttons.items():
+            b.configure(style="NavOn.TButton" if k == key else "Nav.TButton")
+
+    def _leave_pane(self):
+        """Vor dem Wechsel: offener Bereich mit Änderungen? False = abgebrochen."""
+        p = self.pane
+        if p is None or not p.winfo_exists():
+            return True
+        if isinstance(p, FirmwareDialog) and p.__dict__.get("busy") is True:  # Übertragung läuft
+            messagebox.showinfo("PC-Deck", "Bitte warten, bis die Übertragung fertig ist.", parent=self)
+            return False
+        if not p.changed():
+            return True
+        r = messagebox.askyesnocancel("PC-Deck", f"Änderungen unter „{p.title()}“ übernehmen?", parent=self)
+        if r is None:
+            return False
+        if r:
+            p.accept()
+            if self.pane is p and p.winfo_exists():  # z. B. ungültige Eingabe: bleibt offen
+                return False
+        return True
+
+    def _open_pane(self, key, make):
+        """Bereich `key` im rechten Feld zeigen (make() baut ihn)."""
+        if not self._leave_editor() or not self._leave_pane():
+            return
+        self.selected = None
+        self._clear_side()
+        self._set_nav(key)
+        self.render()
+        make()
+        self.side_scroll.top()
+        self.pane_key = key if self.pane is not None else None
+        if self.pane is None:  # Bereich hat sich gleich wieder geschlossen
+            self._set_nav("tiles")
+            self._show_side_hint()
+
+    def _pane_closed(self, pane):
+        if self._clearing or pane is not self.pane:
+            return
+        self.pane = None
+        self.pane_key = None
+        self._design_override = None
+        self._set_nav("tiles")
+        self._show_side_hint()
+        self.render()
+
+    def design_preview(self, cfg):
+        """Design-Bereich: Konfiguration mit den bearbeiteten Design-Werten im Abbild zeigen (None = gespeichert)."""
+        self._design_override = cfg
+        if getattr(self, "_tp_after", None):
+            self.after_cancel(self._tp_after)
+        self._tp_after = self.after(60, self.render)
+
+    def show_help(self):
+        def make():
+            p = _Pane(self)
+            p.title("Hilfe")
+            ttk.Label(p, text=APP_HELP + f"\n\nPC-Deck {VERSION}\nEinstellungen und Protokoll: {APP_DIR}",
+                      wraplength=380, justify="left").pack(anchor="w")
+            ttk.Button(p, text="Schließen", command=p.destroy).pack(anchor="e", pady=(12, 0))
+        self._open_pane("help", make)
+
+    def _show_side_hint(self):
+        self._clear_side()
+        f = ttk.Frame(self.side, style="Panel.TFrame", padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Kachel", style="Head.TLabel").pack(anchor="w")
+        ttk.Label(f, text="Klick auf eine Kachel im Deck zeigt hier ihre Einstellungen. Mit „OK“ geht die "
+                  "Änderung sofort ans Deck.", style="PanelDim.TLabel", wraplength=360, justify="left").pack(
+            anchor="w", pady=(8, 0))
+
+    def _leave_editor(self):
+        """Vor dem Wechsel: offene Änderungen übernehmen? False = abgebrochen (Wechsel nicht durchführen)."""
+        if not self.editor or not self.editor.winfo_exists() or not self.editor.changed():
+            return True
+        r = messagebox.askyesnocancel("PC-Deck", "Änderungen an der Kachel übernehmen?", parent=self)
+        if r is None:
+            return False
+        if r:
+            self.editor.ok()
+        return True
+
+    def select_tile(self, i):
+        if i == self.selected and self.editor:
+            return
+        if not self._leave_editor() or not self._leave_pane():
+            return
+        self._set_nav("tiles")
+        self.selected = i
+        self._clear_side()
+        f = ttk.Frame(self.side, padding=(12, 12))
+        f.pack(fill="both", expand=True)
+        t = self.cfg["pages"][self.page][i]
+        ttk.Label(f, text=f"Kachel {i + 1} auf Seite {self.page + 1}" + (f" – {tile_label(t)}" if t else " (leer)"),
+                  font=("Segoe UI Semibold", 11)).pack(anchor="w", padx=12)
+        page, idx = self.page, i
+        self.editor = TileEditor(f, t, self, lambda res: self._editor_done(page, idx, res))
+        self.editor.pack(fill="both", expand=True)
+        self.side_scroll.top()
+        self.render()
+
+    def _editor_done(self, page, i, res):
+        ed = self.editor
+        if res is None:  # Abbrechen: Feld wieder mit dem gespeicherten Stand
+            self.selected = None
+            self._show_side_hint()
+            self.render()
+            return
+        old = self.cfg["pages"][page][i]
+        if res == "clear":
+            if old and not self._ask_clear_tile(old):
+                return
+            self.cfg["pages"][page][i] = None
+            self._mark_dirty()
+            self._knob_orphans([old])
+        else:
+            self._apply_knob(ed.knob_changes)
+            self.cfg["pages"][page][i] = res
+            self._mark_dirty()
+            if old and old != res:
+                self._knob_orphans([old])
+        self.selected = None
+        self._show_side_hint()
+        self.render()
+
+    def _ask_clear_tile(self, t):
+        return self._confirm(f"Kachel „{tile_label(t)}“ leeren?")
+
+    def edit_design(self, select=None):
+        if is_big(self.cfg):
+            messagebox.showinfo("PC-Deck", "Das Big-Deck kann noch keine Designs – es zeigt die Kacheln immer "
+                                "im einfachen dunklen Stil.", parent=self)
+            return
+        self._open_pane("design", lambda: DesignDialog(self, select))
 
     def _update_status(self):
         link = self.manager.link(self.deck_id)
         if link:
             txt = f"Deck verbunden über {link.port}" if link.via_wlan else f"Deck verbunden über USB ({link.port})"
-            txt += f", Firmware {link.fw}"
+            txt += f", Firmware {fwfile.label(link.fw)}"
+            if getattr(link, "fw_newer", None):
+                txt += f" (Firmware {fwfile.label(link.fw_newer)} verfügbar – „Firmware ...“)"
         else:
             txt = "Deck nicht verbunden – Änderungen werden beim Anstecken übertragen"
         n = sum(len(h) for h in (self.cfg.get("hidden") or []))
         if n:
             txt += f"   •   {n} Kachel(n) ausgeblendet – kommen beim Vergrößern des Rasters zurück"
-        if self.dirty:
-            txt += "   •   ungespeicherte Änderungen"
         self.status.configure(text=txt)
 
     def _mark_dirty(self):
+        """Änderung im Hauptfenster: kurz danach speichern und ans Deck (mehrere schnelle Änderungen gebündelt)."""
         self.dirty = True
-        self._update_status()
+        if self._save_after:
+            self.after_cancel(self._save_after)
+        self._save_after = self.after(500, self.save)
+
+    def _flush_save(self):
+        if self._save_after:
+            self.after_cancel(self._save_after)
+            self._save_after = None
+        if self.dirty:
+            self.save()
+
+    def _confirm(self, text):
+        return messagebox.askokcancel("PC-Deck", text, parent=self)
 
     # ---------------------------------------------------------- Kacheln
     def _set_tile(self, i, tile):
@@ -2210,12 +3046,75 @@ class ConfigWindow(tk.Toplevel):
         self._mark_dirty()
         self.render()
 
+    def _ask_clear(self, i):
+        t = self.cfg["pages"][self.page][i]
+        return not t or self._confirm(f"Kachel „{tile_label(t)}“ leeren?")
+
+    def _ask_replace(self, i):
+        t = self.cfg["pages"][self.page][i]
+        return not t or self._confirm(f"Kachel „{tile_label(t)}“ ersetzen?")
+
     def edit_tile(self, i):
-        d = TileDialog(self, self.cfg["pages"][self.page][i])
+        self.select_tile(i)
+
+    def edit_tile_window(self, i):
+        old = self.cfg["pages"][self.page][i]
+        d = TileDialog(self, old)
         if d.result == "clear":
-            self._set_tile(i, None)
+            if self._ask_clear(i):
+                self._set_tile(i, None)
+                self._knob_orphans([old])
         elif d.result:
+            self._apply_knob(d.knob_changes)
             self._set_tile(i, d.result)
+            if old and old != d.result:
+                self._knob_orphans([old])
+
+    # ---------------------------------------------------------- Drehknopf je Programm (über die Kacheln)
+    def _apply_knob(self, changes):
+        if not changes:
+            return
+        apps = knob.settings(self.cfg)["apps"]
+        for app, p in changes.items():
+            if p:
+                apps[app] = p
+            else:
+                apps.pop(app, None)
+        self.cfg["knob"] = {"apps": apps}
+
+    def _tile_apps(self):
+        out = set()
+        for page in self.cfg["pages"]:
+            for t in page:
+                if t and t.get("type", plugin_api.DEFAULT_TYPE) == plugin_api.DEFAULT_TYPE and t.get("path"):
+                    app = winctl.knob_app(t["path"])
+                    if app:
+                        out.add(app)
+        return out
+
+    def _knob_orphans(self, removed=None):
+        """Belegungen ohne Kachel: nach dem Entfernen von Kacheln (removed) bzw. beim Öffnen (None) nachfragen."""
+        apps = knob.settings(self.cfg)["apps"]
+        if not apps:
+            return
+        have = self._tile_apps()
+        if removed is None:
+            cand = [a for a in apps if a not in have]
+        else:
+            cand = []
+            for t in removed:
+                if t and t.get("path") and t.get("type", plugin_api.DEFAULT_TYPE) == plugin_api.DEFAULT_TYPE:
+                    a = winctl.knob_app(t["path"])
+                    if a in apps and a not in have and a not in cand:
+                        cand.append(a)
+        if not cand:
+            return
+        names = ", ".join(cand)
+        text = (f"Für {names} gibt es eine eigene Drehknopf-Belegung, aber keine Kachel mehr.\n"
+                "Die Belegung lässt sich nur über eine Kachel ändern.\n\nBelegung löschen?")
+        if messagebox.askyesno("Drehknopf", text, parent=self):
+            self._apply_knob({a: False for a in cand})
+            self._mark_dirty()
 
     def on_drop(self, event, i):
         paths = self.tk.splitlist(event.data)
@@ -2223,6 +3122,8 @@ class ConfigWindow(tk.Toplevel):
             return
         cols_rows = self.cfg["cols"] * self.cfg["rows"]
         page = self.cfg["pages"][self.page]
+        if not self._ask_replace(i):
+            return
         # mehrere Dateien: ab der Zielkachel auf freie Plätze verteilen
         slot = i
         for p in paths:
@@ -2246,10 +3147,12 @@ class ConfigWindow(tk.Toplevel):
                       state="normal" if t else "disabled")
         m.add_command(label="Ausschneiden", command=lambda: (setattr(self, "clipboard", dict(t)), self._set_tile(i, None)),
                       state="normal" if t else "disabled")
-        m.add_command(label="Einfügen", command=lambda: self._set_tile(i, dict(self.clipboard)),
+        m.add_command(label="Einfügen", command=lambda: self._ask_replace(i) and self._set_tile(i, dict(self.clipboard)),
                       state="normal" if self.clipboard else "disabled")
         m.add_separator()
-        m.add_command(label="Leeren", command=lambda: self._set_tile(i, None), state="normal" if t else "disabled")
+        m.add_command(label="Leeren", command=lambda: self._ask_clear(i) and (self._set_tile(i, None),
+                                                                              self._knob_orphans([t])),
+                      state="normal" if t else "disabled")
         m.tk_popup(event.x_root, event.y_root)
 
     def on_suggest(self):
@@ -2284,61 +3187,107 @@ class ConfigWindow(tk.Toplevel):
             self.cfg["pages"][p][i] = None
             self.render()
 
+    def _commit(self, *keys):
+        """Diese Einstellungen sofort speichern und ans Deck geben. Andere, noch ungespeicherte Änderungen
+        (z. B. Kacheln) bleiben ungespeichert."""
+        stored = self.config_store.deck_copy(self.deck_id)
+        if stored is None:
+            stored = copy.deepcopy(self.cfg)
+        for k in keys:
+            if k in self.cfg:
+                stored[k] = copy.deepcopy(self.cfg[k])
+            else:
+                stored.pop(k, None)
+        self.config_store.set_deck(self.deck_id, stored)
+        link = self.manager.link(self.deck_id)
+        if link:
+            if keys == ("display",):
+                link.request_options()
+            elif keys != ("brightness",):
+                link.request_sync(force=False)
+
     def on_design(self, _e=None):
-        """Design gewählt (gilt nach „Speichern & ans Deck senden“)."""
+        """Design gewählt: gilt sofort."""
         new = next(i for i, n in theme.CHOICES if n == self.v_design.get())
         if new != theme.design_id(self.cfg):
             self.cfg["design"] = new
-            self._mark_dirty()
+            self._commit("design")
 
-    def edit_theme(self):
-        """Eigenes Design (Startbild, Hintergrund, Kachelfarben) gestalten und auswählen."""
-        icons = []
-        for t in self.cfg["pages"][self.page]:
-            if t and not t.get("text_only") and len(icons) < 8:
-                try:
-                    icons.append(tile_icon(t))
-                except Exception:
-                    pass
-        d = ThemeDialog(self, theme.custom(self.cfg), icons)
-        if d.result is not None:
-            self.cfg["theme"] = d.result
-            self.cfg["design"] = "custom" if d.result.get("enabled") else "off"
-            self.v_design.set(dict(theme.CHOICES)[self.cfg["design"]])
-            self._mark_dirty()
+    def edit_display(self):
+        """Aufbau-Effekt, Dimmen und Uhr im Ruhebild – gilt nach OK sofort."""
+        link = self.manager.link(self.deck_id)
+        if is_big(self.cfg):
+            messagebox.showinfo("PC-Deck", "Das Big-Deck kann Aufbau-Effekt, Dimmen und Uhr im Ruhebild noch "
+                                "nicht.", parent=self)
+            return
 
-    def edit_knob(self):
-        """Belegung des Drehknopfs: Standard und Presets pro Programm."""
-        d = KnobDialog(self, knob.settings(self.cfg), self.cfg)
-        if d.result is not None and d.result != knob.settings(self.cfg):
-            self.cfg["knob"] = d.result
-            self._mark_dirty()
+        def apply(opts):
+            self.cfg["display"] = opts
+            self._commit("display")
+        self._open_pane("display", lambda: DisplayDialog(self, display_opts(self.cfg), link.fw if link else None,
+                                                         apply))
 
     def edit_auto(self):
+        if not self._own():
+            self._extra_info()
+            return
+        self._edit_auto()
+
+    def _edit_auto(self):
         lists = auto_apps(self.cfg)
         elsewhere = {}
         for p, apps in enumerate(lists):
             if p != self.page:
                 for a in apps:
                     elsewhere.setdefault(a.lower(), p + 1)
-        d = AutoDialog(self, self.page + 1, lists[self.page], elsewhere)
-        if d.result is not None and d.result != lists[self.page]:
-            lists[self.page] = d.result
+        before = copy.deepcopy(lists)
+        page = self.page
+
+        def apply(apps):  # OK: speichern und sofort ans Deck
+            new = copy.deepcopy(before)
+            new[page] = apps
             # ein Programm nur auf einer Seite: von den anderen Seiten entfernen
-            mine = {a.lower() for a in d.result}
-            for p in range(len(lists)):
-                if p != self.page:
-                    lists[p] = [a for a in lists[p] if a.lower() not in mine]
-            self.cfg["auto_apps"] = lists
-            self._mark_dirty()
+            mine = {a.lower() for a in apps}
+            for p in range(len(new)):
+                if p != page:
+                    new[p] = [a for a in new[p] if a.lower() not in mine]
+            self.cfg["auto_apps"] = new
+            self._commit("auto_apps")
             self.render()
+        self._open_pane("auto", lambda: AutoDialog(self, page + 1, lists[page], elsewhere, apply=apply))
 
     # ---------------------------------------------------------- Seiten / Raster
+    def _own(self):
+        """Ist die angezeigte Seite eine eigene (bearbeitbare) Seite?"""
+        return self.page < len(self.cfg["pages"])
+
+    def _extra_info(self):
+        title = (self._view_cfg().get("page_titles") or {}).get(self.page, "")
+        where = "„Soundboard“" if title == "Soundboard" else "„SmartHome“"
+        messagebox.showinfo("PC-Deck", f"Die Seite „{title}“ entsteht automatisch – ändern unter {where} links.",
+                            parent=self)
+
     def goto_page(self, d):
-        self.page = (self.page + d) % len(self.cfg["pages"])
+        if not self._leave_editor():
+            return
+        auto = self.pane_key == "auto"
+        if not self._leave_pane():
+            return
+        self.page = (self.page + d) % len(self._view_cfg()["pages"])
+        self.selected = None
+        self._clear_side()
+        self._set_nav("tiles")
+        self._show_side_hint()
         self.render()
+        if auto and self._own():
+            self.edit_auto()
 
     def add_page(self):
+        if not self._own():
+            self.page = len(self.cfg["pages"]) - 1  # neue eigene Seite hinter der letzten eigenen
+        self._add_page()
+
+    def _add_page(self):
         if len(self.cfg["pages"]) >= MAX_PAGES:
             messagebox.showinfo("PC-Deck", f"Maximal {MAX_PAGES} Seiten.", parent=self)
             return
@@ -2351,18 +3300,30 @@ class ConfigWindow(tk.Toplevel):
         self.render()
 
     def del_page(self):
+        if not self._own():
+            self._extra_info()
+            return
+        self._del_page()
+
+    def _del_page(self):
         if len(self.cfg["pages"]) <= 1:
+            if any(self.cfg["pages"][0]) and not self._confirm("Alle Kacheln dieser Seite löschen?"):
+                return
             self.cfg["pages"][0] = empty_page(self.cfg["cols"], self.cfg["rows"])
             self.cfg["hidden"] = [[]]
         else:
-            if any(self.cfg["pages"][self.page]) and not messagebox.askyesno(
-                    "PC-Deck", "Diese Seite mit allen Kacheln löschen?", parent=self):
+            if any(self.cfg["pages"][self.page]) and not self._confirm("Diese Seite mit allen Kacheln löschen?"):
                 return
+            removed = list(self.cfg["pages"][self.page])
             self.cfg["auto_apps"] = auto_apps(self.cfg)
             del self._hidden()[self.page]
             del self.cfg["pages"][self.page]
             del self.cfg["auto_apps"][self.page]
             self.page = max(0, self.page - 1)
+            self._mark_dirty()
+            self.render()
+            self._knob_orphans(removed)
+            return
         self._mark_dirty()
         self.render()
 
@@ -2381,6 +3342,13 @@ class ConfigWindow(tk.Toplevel):
         if (cols, rows) == (oc, orow):
             return
         hidden = self._hidden()
+        lost = sum(1 for page in self.cfg["pages"] for idx, t in enumerate(page)
+                   if t and (idx // oc >= rows or idx % oc >= cols))
+        if lost and not self._confirm(f"{lost} Kachel(n) passen nicht mehr ins kleinere Raster und werden "
+                                      "ausgeblendet.\nBeim Vergrößern kommen sie an ihre Stelle zurück."):
+            self.v_cols.set(oc)
+            self.v_rows.set(orow)
+            return
         new_pages, new_hidden = [], []
         for page, hid in zip(self.cfg["pages"], hidden):
             np_ = empty_page(cols, rows)
@@ -2401,24 +3369,17 @@ class ConfigWindow(tk.Toplevel):
         self.render()
 
     # ---------------------------------------------------------- Decks
-    def _ask_save(self):
-        if not self.dirty:
-            return True
-        r = messagebox.askyesnocancel("PC-Deck", "Änderungen speichern und ans Deck senden?", parent=self)
-        if r is None:
-            return False
-        if r:
-            self.save()
-        return True
-
     def on_deck_selected(self, _e=None):
         ids = self._deck_ids()
         new_id = ids[self.deck_box.current()]
         if new_id == self.deck_id:
             return
-        if not self._ask_save():
+        if not self._leave_editor():
             self.deck_box.current(ids.index(self.deck_id))
             return
+        self._flush_save()
+        self.selected = None
+        self._show_side_hint()
         self.deck_id = new_id
         self.cfg = self.config_store.deck_copy(new_id)
         self.page = 0
@@ -2452,6 +3413,9 @@ class ConfigWindow(tk.Toplevel):
 
     # ---------------------------------------------------------- Aktionen
     def _live_brightness(self):
+        """Helligkeit gilt sofort (am Deck und gespeichert)."""
+        self.cfg["brightness"] = int(self.v_bri.get())
+        self._commit("brightness")
         link = self.manager.link(self.deck_id)
         if link:
             link.request_brightness(self.v_bri.get())
@@ -2461,26 +3425,59 @@ class ConfigWindow(tk.Toplevel):
             messagebox.showinfo("PC-Deck", "Das Deck ist nicht verbunden. Zum Einrichten des WLANs bitte per "
                                 "USB anstecken.", parent=self)
             return
-        WifiDialog(self, self.manager, self.config_store, self.deck_id)
+        self._open_pane("wifi", lambda: WifiDialog(self, self.manager, self.config_store, self.deck_id))
 
     def edit_soundboard(self):
-        SoundboardDialog(self)
+        self._open_pane("sound", lambda: SoundboardDialog(self))
 
     def edit_smarthome(self):
-        BoschDialog(self)
+        self._open_pane("home", lambda: BoschDialog(self))
 
-    def edit_firmware(self):
-        FirmwareDialog(self, self.manager, self.deck_id)
+    def edit_firmware(self, auto=False):
+        if is_big(self.cfg):
+            messagebox.showinfo("PC-Deck", "Die Firmware des Big-Decks gehört zum grblHAL-Display und wird dort "
+                                "aktualisiert, nicht über die App.", parent=self)
+            return
+        self._open_pane("fw", lambda: FirmwareDialog(self, self.manager, self.deck_id, auto))
+
+    def show_firmware_update(self, deck_id):
+        """Nach „Ja“ auf die Abfrage: dieses Deck zeigen und die mitgelieferte Firmware gleich aufspielen."""
+        if deck_id != self.deck_id:
+            ids = self._deck_ids()
+            if deck_id not in ids:
+                return
+            self.deck_box.current(ids.index(deck_id))
+            self.on_deck_selected()
+            if self.deck_id != deck_id:
+                return
+        self.edit_firmware(auto=True)
 
     def calibrate(self):
-        link = self.manager.link(self.deck_id)
-        if not link:
-            messagebox.showinfo("PC-Deck", "Das Deck ist nicht verbunden.", parent=self)
-            return
-        link.request_calibration()
-        messagebox.showinfo("PC-Deck", "Auf dem Display jetzt die Ecken der Reihe nach antippen.", parent=self)
+        def make():
+            p = _Pane(self)
+            p.title("Touch kalibrieren")
+            ttk.Label(p, wraplength=380, justify="left",
+                      text="Hilft, wenn Tipper am Deck an der falschen Stelle ankommen.\n\nNach dem Start erscheinen "
+                           "auf dem Display nacheinander Markierungen in den Ecken – jeweils genau in die Mitte "
+                           "tippen (am besten mit einem Stift). Danach speichert das Deck die Werte.").pack(anchor="w")
+            msg = ttk.Label(p, foreground=DIM, wraplength=380, justify="left")
+            msg.pack(anchor="w", pady=(10, 0))
+
+            def start():
+                link = self.manager.link(self.deck_id)
+                if not link:
+                    msg.configure(text="Das Deck ist nicht verbunden.")
+                    return
+                link.request_calibration()
+                msg.configure(text="Läuft – jetzt am Display die Ecken der Reihe nach antippen.")
+            b = ttk.Frame(p)
+            b.pack(anchor="e", pady=(12, 0))
+            ttk.Button(b, text="Schließen", command=p.destroy).pack(side="left", padx=4)
+            ttk.Button(b, text="Kalibrieren starten", style="Accent.TButton", command=start).pack(side="left")
+        self._open_pane("touch", make)
 
     def save(self):
+        self._save_after = None
         self.cfg["brightness"] = int(self.v_bri.get())
         self.config_store.set_deck(self.deck_id, self.cfg)
         self.dirty = False
@@ -2490,5 +3487,7 @@ class ConfigWindow(tk.Toplevel):
         self._update_status()
 
     def close(self):
-        if self._ask_save():
-            self.destroy()
+        self._flush_save()
+        self._remember_layout()
+        self.config_store.save()
+        self.destroy()

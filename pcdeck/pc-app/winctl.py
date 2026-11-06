@@ -29,6 +29,7 @@ if os.name == "nt":
     user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
     user32.GetWindow.restype = wt.HWND
     user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+    user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
     user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
     user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
     user32.IsIconic.argtypes = [wt.HWND]
@@ -306,6 +307,33 @@ def target_exe(tile, path):
     return target if target and target.lower().endswith(".exe") else None
 
 
+def knob_app(path):
+    """Programm, das bei dieser Kachel im Vordergrund ist (für die Drehknopf-Belegung), klein geschrieben:
+    .exe/.lnk -> die Programmdatei, Ordner -> explorer.exe, Datei/Adresse -> das Programm, das Windows dafür
+    startet. None, wenn es sich nicht ermitteln lässt."""
+    path = (path or "").strip().strip('"')
+    if not path:
+        return None
+    if path.lower().startswith(("http://", "https://")):
+        assoc = "http"
+    else:
+        target = (iconextract.lnk_target(path) or path) if path.lower().endswith(".lnk") else path
+        if os.path.isdir(target):
+            return "explorer.exe"
+        if target.lower().endswith(".exe"):
+            return os.path.basename(target).lower()
+        assoc = os.path.splitext(target)[1]
+        if not assoc:
+            return None
+    buf = ctypes.create_unicode_buffer(520)
+    n = ctypes.c_ulong(520)
+    # ASSOCSTR_EXECUTABLE = 2
+    if ctypes.windll.shlwapi.AssocQueryStringW(0, 2, assoc, None, buf, ctypes.byref(n)) != 0:
+        return None
+    exe = os.path.basename(buf.value).lower()
+    return exe if exe.endswith(".exe") else None
+
+
 def folder_target(path):
     """Verknüpfung (.lnk) auf einen Ordner -> dieser Ordner (dann wie eine Ordner-Kachel behandeln)."""
     if path.lower().endswith(".lnk"):
@@ -365,6 +393,31 @@ def _blocked(hwnds):
         if not _elevated(pid.value):
             return False
     return True
+
+
+GWL_EXSTYLE, WS_EX_TOOLWINDOW = -20, 0x80
+_admin_pids = {}
+
+
+def suggestable(hwnd, pid):
+    """Taugt das Vordergrundfenster für die Plus-Kachel? Nein bei Hilfsfenstern (unsichtbar, ohne Titel,
+    Werkzeugfenster ohne Taskleisten-Eintrag) und bei Programmen mit Administratorrechten – die kann PC-Deck
+    weder steuern noch ohne Abfrage starten (z. B. Lüfter-/Display-Tools wie „LCD Device“)."""
+    if not hwnd or os.name != "nt":
+        return False
+    if (not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) <= 0
+            or user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW):
+        return False
+    global _self_admin
+    if _self_admin is None:
+        _self_admin = _elevated(os.getpid())
+    if _self_admin:
+        return True
+    if pid not in _admin_pids:
+        if len(_admin_pids) > 200:
+            _admin_pids.clear()
+        _admin_pids[pid] = _elevated(pid)
+    return not _admin_pids[pid]
 
 
 def minimize_or_restore(tile, path):

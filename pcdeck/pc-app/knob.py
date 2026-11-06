@@ -1,7 +1,8 @@
 """Drehknopf am Deck (ab Firmware 10): Drehen und Drücken je nach Programm im Vordergrund.
 
 Das Deck meldet "ROT +n" / "ROT -n" (Rasten, + = im Uhrzeigersinn), ab FW 11 "ROTP +n" (gedrückt
-gedreht), "KNOB" (kurz gedrückt) und "KNOBLONG" (ab 0,6 s). Pro Deck steht unter "knob" eine
+gedreht), "KNOB" (kurz gedrückt) und "KNOBLONG" (ab 0,6 s). Zweimal schnell "KNOB" (0,4 s) erkennt die App
+als Doppeldruck (ab App 1.11.7). Pro Deck steht unter "knob" eine
 Standard-Belegung und je Programm ein eigenes Preset:
 
     "knob": {"default": {...}, "apps": {"discord.exe": {...}, "msedge.exe": {...}}}
@@ -10,8 +11,10 @@ Seiten blättern und Kacheln auslösen erledigt der DeckLink selbst (braucht die
 alles andere läuft hier nacheinander in einem eigenen Thread, damit die Verbindung nie wartet.
 """
 
+import ctypes
 import logging
 import queue
+import subprocess
 import threading
 import time
 
@@ -29,13 +32,19 @@ ROT_ACTIONS = [("volume", "Lautstärke (System)"), ("app_volume", "Lautstärke d
 PRESS_ACTIONS = [("mute", "Ton stumm / an"), ("mic_mute", "Mikrofon stumm / an"), ("play_pause", "Play / Pause"),
                  ("next", "Nächster Titel"), ("prev", "Voriger Titel"),
                  ("screenshot", "Screenshot (Ausschnitt, Win+Umschalt+S)"), ("output", "Nächstes Ausgabegerät"),
-                 ("tile", "Kachel auslösen"), ("page1", "Seite 1 zeigen"), ("keys", "Tastenkürzel"), ("off", "Aus")]
+                 ("tile", "Kachel auslösen"), ("page1", "Seite 1 zeigen"), ("keys", "Tastenkürzel"),
+                 ("sleep", "Energie sparen (10 s, Drücken = abbrechen)"), ("shutdown", "Herunterfahren (10 s, Drücken = abbrechen)"),
+                 ("off", "Aus")]
+DOUBLE_S = 0.4      # zweiter Druck innerhalb dieser Zeit = Doppeldruck
+SHUTDOWN_S = 10     # Countdown vor dem Herunterfahren bzw. Energie sparen
 LINK_ACTIONS = {"pages", "page1", "tile"}  # führt der DeckLink aus
 
-DEFAULT_PRESET = {"rot": "volume", "rotp": "output", "press": "mute", "long": "off", "step": 2, "app": "",
-                  "devices": [], "devices_names": {},
+DEFAULT_PRESET = {"rot": "volume", "rotp": "output", "press": "mute", "long": "shutdown", "double": "sleep",
+                  "step": 2, "app": "", "devices": [], "devices_names": {},
                   "keys_left": "", "keys_right": "", "keysp_left": "", "keysp_right": "",
-                  "keys_press": "", "keys_long": "", "tile_press": "", "tile_long": "", "tile_rot": ""}
+                  "keys_press": "", "keys_long": "", "keys_double": "", "tile_press": "", "tile_long": "",
+                  "tile_double": "", "tile_rot": ""}
+PRESS_KINDS = ("press", "long", "double")  # kurz, lang, doppelt
 VK_PLAY_PAUSE, VK_NEXT, VK_PREV = 0xB3, 0xB0, 0xB1
 SCREENSHOT = [0x5B, 0x10, 0x53]  # Win+Umschalt+S
 MAX_REPEAT = 20  # Tastenkürzel/Mausrad je Meldung höchstens so oft (sehr schnelles Drehen)
@@ -61,7 +70,7 @@ def settings(cfg):
     if "mode" in k:  # Stand FW 10: ein Modus für alles
         old = dict(k)
         k = {"default": dict(old, **_OLD_MODES.get(old.pop("mode"), {}))}
-    return {"default": preset(k.get("default")),
+    return {"default": preset(None),  # Standard ist fest (ab App 1.10.7); eigene Belegung je Programm
             "apps": {a.lower(): preset(p) for a, p in (k.get("apps") or {}).items()}}
 
 
@@ -108,16 +117,44 @@ class Worker:
         self.osd = osd or (lambda pct, text: None)
         self.jobs = queue.Queue()
         self._shown = ("", 0.0)  # zuletzt angezeigte Aktion (Text, Zeit)
+        self._shutdown = None    # laufender Countdown: threading.Event zum Abbrechen
         threading.Thread(target=self._run, daemon=True).start()
 
-    def _show(self, text):
-        """Aktion am Deck anzeigen (nur die Funktion, ohne Programmname). Beim schnellen Drehen höchstens
-        alle 0,3 s neu schicken – die Anzeige bleibt so stehen, solange gedreht wird."""
-        now = time.monotonic()
-        if self._shown[0] == text and now - self._shown[1] < 0.3:
-            return
-        self._shown = (text, now)
-        self.osd(None, text)
+    # -- Herunterfahren / Energie sparen (beide mit Countdown am Deck)
+    def cancel_shutdown(self):
+        """Countdown läuft? Dann abbrechen (True) – jeder Druck am Knopf bricht ab."""
+        cd = self._shutdown
+        if cd is None:
+            return False
+        cd[0].set()
+        self._shutdown = None
+        self.osd(None, "Herunterfahren abgebrochen" if cd[1] == "shutdown" else "Energie sparen abgebrochen")
+        log.info("Drehknopf: %s abgebrochen", cd[1])
+        return True
+
+    def _start_countdown(self, kind):
+        """kind "shutdown" (PC aus) oder "sleep" (Standby) nach SHUTDOWN_S Sekunden."""
+        ev = threading.Event()
+        self._shutdown = (ev, kind)
+        word = "Aus" if kind == "shutdown" else "Standby"
+
+        def run():
+            for left in range(SHUTDOWN_S, 0, -1):
+                self.osd(int(left * 100 / SHUTDOWN_S), f"{word} in {left} s - Druck: Stopp")
+                if ev.wait(1.0):
+                    return
+            if not self._shutdown or self._shutdown[0] is not ev:
+                return
+            self._shutdown = None
+            if kind == "shutdown":
+                log.info("Drehknopf: PC wird heruntergefahren")
+                subprocess.Popen(["shutdown", "/s", "/t", "0"], creationflags=0x08000000)  # CREATE_NO_WINDOW
+            else:
+                log.info("Drehknopf: Energie sparen")
+                self.osd(None, "Energie sparen")
+                time.sleep(1.0)  # Anzeige kurz stehen lassen
+                ctypes.windll.powrprof.SetSuspendState(False, False, False)
+        threading.Thread(target=run, daemon=True).start()
 
     def _run(self):
         while True:
@@ -158,9 +195,12 @@ class Worker:
                     self._do(winkeys.send_sequence, seq)
                 self._show(f"Tasten: {seq.strip()}")
 
-    # -- Drücken (kurz oder lang)
-    def press(self, p, long):
-        action = p["long" if long else "press"]
+    # -- Drücken (kind: "press" kurz, "long" lang, "double" zweimal schnell)
+    def press(self, p, kind):
+        action = p[kind]
+        if action in ("shutdown", "sleep"):
+            self._start_countdown(action)
+            return
         if action == "mute":
             self._do(self._mute)
         elif action == "mic_mute":
@@ -175,7 +215,7 @@ class Worker:
         elif action == "output":
             self._do(self._output, p, 1)
         elif action == "keys":
-            seq = p["keys_long" if long else "keys_press"]
+            seq = p["keys_" + kind]
             if seq.strip():
                 self._do(winkeys.send_sequence, seq)
                 self._show(f"Tasten: {seq.strip()}")
