@@ -3490,4 +3490,5 @@ class ConfigWindow(tk.Toplevel):
         self._flush_save()
         self._remember_layout()
         self.config_store.save()
+        self._clearing = True  # offener Bereich wird mit abgebaut: _pane_closed darf nichts neu aufbauen
         self.destroy()
