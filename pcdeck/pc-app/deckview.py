@@ -208,15 +208,14 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
         d.text((BIG_GRID_W - BIG_GAP - 80, y0 + BIG_NAV_H // 2), ">", font=font(24), fill=COL_TEXT, anchor="mm")
         nav = ascii_label(title) if title else f"{page + 1} / {pages}"
         d.text((BIG_GRID_W // 2, y0 + BIG_NAV_H // 2), nav, font=font(22), fill=COL_TEXT, anchor="mm")
-    # Lautstärke-Leiste wie deck.cpp (Big-Deck FW 38): Mischpult-Fader – Schlitz 8x440 (y 50..490) mit Skala,
-    # leuchtender Pegel, Kappe 60x40 mit Mittellinie und Rillen; Lautsprecher oben, Wert unten
+    # Lautstärke-Leiste wie deck.cpp (Big-Deck FW 38): Mischpult-Fader – Schlitz 8x420 (y 60..480) mit Skala,
+    # leuchtender Pegel, silberne Sattel-Kappe 46x64; Lautsprecher oben, Wert unten
     cx = BIG_GRID_W + BIG_VOL_W // 2
     d.polygon([(cx - 9, 12), (cx - 4, 12), (cx + 2, 6), (cx + 2, 24), (cx - 4, 18), (cx - 9, 18)], fill=COL_DIM)
-    sy, sh = 50, 440
+    sy, sh = 60, 420
     for n in range(11):  # Skala
-        y = sy + n * 44
-        big_tick = n in (0, 5, 10)
-        ln, col = (12, (0x7A, 0x7F, 0x8C)) if big_tick else (7, (0x4A, 0x4E, 0x58))
+        y = sy + n * 42
+        ln, col = (12, (0x7A, 0x7F, 0x8C)) if n in (0, 5, 10) else (7, (0x4A, 0x4E, 0x58))
         d.rectangle((cx - 10 - ln, y - 1, cx - 11, y), fill=col)
         d.rectangle((cx + 10, y - 1, cx + 9 + ln, y), fill=col)
     d.rounded_rectangle((cx - 4, sy, cx + 3, sy + sh - 1), 4, fill=(0x07, 0x08, 0x0B), outline=(0x3A, 0x3E, 0x48))
@@ -227,24 +226,49 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
     glow = glow.filter(ImageFilter.GaussianBlur(6))
     out.paste(Image.new("RGB", glow.size, COL_ACCENT), (BIG_GRID_W, 0), glow)
     d.rounded_rectangle((cx - 4, ky, cx + 3, sy + sh - 1), 4, fill=COL_ACCENT)
-    kx0, ky0 = cx - 30, ky - 20
+    CW, CH, E = 46, 64, 18  # Kappe Breite, Höhe, erhöhte Enden
+    kx0, ky0 = cx - CW // 2, ky - CH // 2
     sh_m = Image.new("L", (BIG_VOL_W, BIG_H))
-    ImageDraw.Draw(sh_m).rounded_rectangle((kx0 - BIG_GRID_W, ky0 + 4, kx0 - BIG_GRID_W + 59, ky0 + 43), 5, fill=180)
+    ImageDraw.Draw(sh_m).rounded_rectangle((kx0 - BIG_GRID_W, ky0 + 4, kx0 - BIG_GRID_W + CW - 1, ky0 + CH + 3), 6,
+                                           fill=180)
     sh_m = sh_m.filter(ImageFilter.GaussianBlur(7))
     out.paste(Image.new("RGB", sh_m.size, (0, 0, 0)), (BIG_GRID_W, 0), sh_m)
-    cap = Image.new("RGB", (60, 40))
+    # Kappe in Sattelform (wie deck.cpp): erhöhte Enden mit Riffeln, Mulde dazwischen, weiße Mittellinie
+    cap = Image.new("RGB", (CW, CH))
     cp = ImageDraw.Draw(cap)
-    for r in range(40):
-        cp.line((0, r, 59, r), fill=_mix((0xD9, 0xDC, 0xE3), (0x7C, 0x81, 0x8C), r / 39))
-    cp.rounded_rectangle((0, 0, 59, 39), 5, outline=(0x4A, 0x4E, 0x58))
-    for dy in (-15, -10, -5, 5, 10, 15):  # Rillen: dunkle Linie, darunter helle
-        cp.line((5, 20 + dy, 54, 20 + dy), fill=(0x3A, 0x3D, 0x46))
-        y2 = 21 + dy
-        for xx in range(5, 55):
-            cap.putpixel((xx, y2), _mix(cap.getpixel((xx, y2)), (255, 255, 255), 110 / 255))
-    cp.rectangle((2, 19, 57, 20), fill=(255, 255, 255))  # Mittellinie
-    m = Image.new("L", (60, 40))
-    ImageDraw.Draw(m).rounded_rectangle((0, 0, 59, 39), 5, fill=255)
+
+    def vgrad(y0, y1, c0, c1, x0=0, x1=CW - 1):
+        for r in range(y0, y1 + 1):
+            cp.line((x0, r, x1, r), fill=_mix(c0, c1, (r - y0) / max(1, y1 - y0)))
+
+    def blend_line(y, x0, x1, col, a):
+        for xx in range(x0, x1 + 1):
+            cap.putpixel((xx, y), _mix(cap.getpixel((xx, y)), col, a / 255))
+
+    cy = CH // 2
+    vgrad(0, CH - 1, (0xD9, 0xDC, 0xE3), (0x7C, 0x81, 0x8C))
+    vgrad(1 + E, cy - 1, (0x80, 0x84, 0x8E), (0xC6, 0xC9, 0xD0), 1, CW - 2)  # Mulde
+    vgrad(cy, CH - 2 - E, (0xC6, 0xC9, 0xD0), (0x80, 0x84, 0x8E), 1, CW - 2)
+    for y0, c0, c1 in ((1, (0xE6, 0xE8, 0xED), (0xA9, 0xAD, 0xB6)),
+                       (CH - 1 - E, (0xA9, 0xAD, 0xB6), (0xE6, 0xE8, 0xED))):  # erhöhte Enden
+        end_img = Image.new("RGB", (CW - 2, E))
+        ed = ImageDraw.Draw(end_img)
+        for r in range(E):
+            ed.line((0, r, CW - 3, r), fill=_mix(c0, c1, r / (E - 1)))
+        em = Image.new("L", (CW - 2, E))
+        ImageDraw.Draw(em).rounded_rectangle((0, 0, CW - 3, E - 1), 5, fill=255)
+        cap.paste(end_img, (1, y0), em)
+    for y in (4, 8, 12, CH - 1 - 5, CH - 1 - 9, CH - 1 - 13):  # Riffel
+        cp.line((4, y, CW - 5, y), fill=(0x3A, 0x3D, 0x46))
+        blend_line(y + 1, 4, CW - 5, (255, 255, 255), 110)
+    blend_line(1, 6, CW - 7, (255, 255, 255), 120)  # Glanz oben
+    blend_line(cy - 2, 1, CW - 2, (0x3A, 0x3D, 0x46), 160)  # Mittellinie
+    cp.line((1, cy - 1, CW - 2, cy - 1), fill=(255, 255, 255))
+    cp.line((1, cy, CW - 2, cy), fill=(255, 255, 255))
+    blend_line(cy + 1, 1, CW - 2, (0x3A, 0x3D, 0x46), 160)
+    cp.rounded_rectangle((0, 0, CW - 1, CH - 1), 6, outline=(0x4A, 0x4E, 0x58))
+    m = Image.new("L", (CW, CH))
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, CW - 1, CH - 1), 6, fill=255)
     out.paste(cap, (kx0, ky0), m)
     d = ImageDraw.Draw(out)
     d.text((cx, BIG_H - 6), str(v) if volume is not None else "", font=font(16), fill=COL_DIM, anchor="md")
