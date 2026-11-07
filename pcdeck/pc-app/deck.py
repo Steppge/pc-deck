@@ -61,6 +61,7 @@ BIG_W = 1024
 BIG_MODEL = "bigdeck"
 BIG_COLS_RANGE = (2, 6)
 BIG_ROWS_RANGE = (1, 4)
+BIG_FW_DESIGN = 38  # ab dieser Big-Deck-Firmware: Designs, Dimmen, Uhr im Ruhebild, Aufbau-Effekt
 BAUD = 921600
 # USB-Seriell-Chips, die auf ESP32-Boards sitzen (Espressif, WCH CH340/CH343, Silabs CP210x, FTDI)
 ESP_VIDS = {0x303A, 0x1A86, 0x10C4, 0x0403}
@@ -661,6 +662,11 @@ class DeckLink(threading.Thread):
                      parts[5], parts[6])
 
     @property
+    def big_old(self):
+        """Big-Deck mit Firmware vor 38: keine Designs und Anzeige-Optionen."""
+        return self.big and self.fw < BIG_FW_DESIGN
+
+    @property
     def via_wlan(self):
         return isinstance(self.ser, netlink.NetConn)
 
@@ -777,13 +783,13 @@ class DeckLink(threading.Thread):
 
     def _sync_theme(self):
         """Design (Startbild, Seitenbild, Farben) übertragen, wenn es sich geändert hat (ab FW 8)."""
-        if self.fw < 8 or self.big:  # Big-Deck: noch keine Designs
+        if self.fw < 8 or self.big_old:  # Big-Deck: Designs erst ab FW 38
             return
         cfg = self.manager.config.deck_view(self.deck_id)
         t = theme.settings(cfg) if cfg else None
         if t is None:
             return  # "Auf dem Deck lassen" (z. B. Deck von einem anderen PC): Design nicht anrühren
-        res = theme.build(t, self._logo())
+        res = theme.build(t, self._logo(), self.big)
         if not res:
             if self.theme_hash != "none":
                 self._cmd("THEME off")
@@ -796,8 +802,7 @@ class DeckLink(threading.Thread):
         for name in ("boot", "page"):
             data = res[name]
             self._cmd(f"IMG {name} {len(data)}")
-            for k in range(0, len(data), 4096):  # Blöcke mit ACK: Flash-Schreiben bremst den Empfang
-                self._cmd(f"DATA {len(data[k:k + 4096])}", data[k:k + 4096], timeout=10)
+            self._send_img_data(data)
             self._cmd("IMGEND", timeout=10)
         self._cmd(f"THEME {res['theme_line']}", timeout=10)
         self.theme_hash = res["hash"]
@@ -807,14 +812,20 @@ class DeckLink(threading.Thread):
 
     def _send_page_image(self, data):
         self._cmd(f"IMG page {len(data)}")
-        for k in range(0, len(data), 4096):  # Blöcke mit ACK: Flash-Schreiben bremst den Empfang
-            self._cmd(f"DATA {len(data[k:k + 4096])}", data[k:k + 4096], timeout=10)
+        self._send_img_data(data)
         self._cmd("IMGEND", timeout=10)
+
+    def _send_img_data(self, data):
+        """Bilddaten in DATA-Blöcken mit ACK (Flash-Schreiben bremst den Empfang). Big-Deck: 1024 Byte – bei 4096
+        gehen dort nach wenigen Blöcken Bytes verloren (ERR short, FW 38)."""
+        n = 1024 if self.big else 4096
+        for k in range(0, len(data), n):
+            self._cmd(f"DATA {len(data[k:k + n])}", data[k:k + n], timeout=10)
 
     def _preview_theme(self, t):
         """Vorschau beim Bearbeiten des Designs: nur Seitenbild (wenn es sich ändert) und Farben, nie das
         Startbild – das geht erst mit OK (vollständige Übertragung). t = None: gespeichertes Design zurück."""
-        if self.fw < 8 or self.big:
+        if self.fw < 8 or self.big_old:
             return
         if t is None:
             if self.preview_page is None:
@@ -822,7 +833,7 @@ class DeckLink(threading.Thread):
             self.preview_page = None
             cfg = self.manager.config.deck_view(self.deck_id)
             ts = theme.settings(cfg) if cfg else None
-            res = theme.build(ts, self._logo()) if ts else None
+            res = theme.build(ts, self._logo(), self.big) if ts else None
             if res:
                 self._send_page_image(res["page"])  # Startbild ist unverändert -> alte Prüfsumme stimmt wieder
                 self._cmd(f"THEME {res['theme_line']}", timeout=10)
@@ -831,7 +842,7 @@ class DeckLink(threading.Thread):
                 self._cmd("THEME off")
                 self.theme_hash = "none"
         else:
-            res = theme.build(t, self._logo())
+            res = theme.build(t, self._logo(), self.big)
             if not res:
                 self._cmd("THEME off")
                 self.theme_hash = "none"

@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 W, H = 480, 320
 PAGE_W, PAGE_H = 240, 160
+BIG_PAGE_W, BIG_PAGE_H = 470, 270  # Big-Deck: halbe Kachelfläche 940x540, das Deck vergrößert x2 (ab FW 38)
 CYAN = (0, 230, 255)
 # Logo-Text für Decks mit älterer Firmware ohne "LOGO"-Befehl; neuere melden ihren selbst.
 # Eigener Text: Datei logo_local.py (nicht im Repository) mit LOGO = ("Widmung", "Name", True/False für TM).
@@ -313,9 +314,9 @@ def boot_image(img, mono=False, logo=LOGO):
     return ImageOps.grayscale(out).convert("RGB") if mono else out
 
 
-def page_image(img, brightness):
-    """Seitenbild 240x160: weichgezeichnet und abgedunkelt (schemenhaft)."""
-    small = ImageOps.fit(img.convert("RGB"), (PAGE_W, PAGE_H), Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.5))
+def page_image(img, brightness, size=(PAGE_W, PAGE_H)):
+    """Seitenbild 240x160 (Big-Deck 470x270): weichgezeichnet und abgedunkelt (schemenhaft)."""
+    small = ImageOps.fit(img.convert("RGB"), size, Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.5))
     return ImageEnhance.Brightness(small).enhance(brightness / 100)
 
 
@@ -341,10 +342,10 @@ _cache = {}
 _lock = threading.Lock()
 
 
-def build(t, logo=None):
+def build(t, logo=None, big=False):
     """Fertiges Design: {"hash", "boot", "page" (RGB565-Bytes), "theme_line", "colors", Vorschaubilder}.
     logo = Logo-Text des Decks (Widmung, Name, TM), sonst der von Deck 1. None, wenn das Design aus ist
-    oder das Bild fehlt."""
+    oder das Bild fehlt. big = Big-Deck: Seitenbild 470x270, kein Startbild (das Display hat sein eigenes)."""
     if not t or not t.get("enabled"):
         return None
     skey = _source_key(t.get("image", ""))
@@ -355,12 +356,18 @@ def build(t, logo=None):
                   bool(t.get("mono")))
     if logo != LOGO:
         key += logo  # Deck 1 behält seine bisherige Prüfsumme
+    if big:
+        key += ("big",)
     with _lock:
         if key in _cache:
             return _cache[key]
     img = _load(skey[0])
     top, bottom, btop, bbottom = colors(t, img)
-    boot, page = boot_image(img, bool(t.get("mono")), logo), page_image(img, t.get("bg_brightness", 30))
+    if big:  # Startbild nimmt das Big-Deck nur an und verwirft es: ein Pixel genügt
+        boot = Image.new("RGB", (1, 1))
+        page = page_image(img, t.get("bg_brightness", 30), (BIG_PAGE_W, BIG_PAGE_H))
+    else:
+        boot, page = boot_image(img, bool(t.get("mono")), logo), page_image(img, t.get("bg_brightness", 30))
     style = STYLE_CODE.get(t.get("style", "glass"), 3)
     alpha = int(t.get("tile_alpha", 80) * 255 / 100)
     digest = hashlib.md5(repr(key).encode() + b"v1").hexdigest()[:16]

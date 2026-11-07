@@ -3002,10 +3002,17 @@ class ConfigWindow(tk.Toplevel):
     def _ask_clear_tile(self, t):
         return self._confirm(f"Kachel „{tile_label(t)}“ leeren?")
 
+    def _big_old(self, what):
+        """Big-Deck mit Firmware vor 38 verbunden: Hinweis zeigen, True = Bereich nicht öffnen."""
+        link = self.manager.link(self.deck_id)
+        if not (is_big(self.cfg) and link and link.fw < 38):
+            return False
+        messagebox.showinfo("PC-Deck", f"{what} kann das Big-Deck erst ab Firmware 1.038 (es hat "
+                            f"{fwfile.label(link.fw)}). Die Firmware kommt mit dem grblHAL-Display.", parent=self)
+        return True
+
     def edit_design(self, select=None):
-        if is_big(self.cfg):
-            messagebox.showinfo("PC-Deck", "Das Big-Deck kann noch keine Designs – es zeigt die Kacheln immer "
-                                "im einfachen dunklen Stil.", parent=self)
+        if self._big_old("Designs"):
             return
         self._open_pane("design", lambda: DesignDialog(self, select))
 
@@ -3216,9 +3223,7 @@ class ConfigWindow(tk.Toplevel):
     def edit_display(self):
         """Aufbau-Effekt, Dimmen und Uhr im Ruhebild – gilt nach OK sofort."""
         link = self.manager.link(self.deck_id)
-        if is_big(self.cfg):
-            messagebox.showinfo("PC-Deck", "Das Big-Deck kann Aufbau-Effekt, Dimmen und Uhr im Ruhebild noch "
-                                "nicht.", parent=self)
+        if self._big_old("Aufbau-Effekt, Dimmen und Uhr im Ruhebild"):
             return
 
         def apply(opts):

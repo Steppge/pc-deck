@@ -147,7 +147,12 @@ def _fit(d, text, max_w, fnt=None):
 
 def _render_big(cfg, page, live, title, selected, accent, volume):
     """Big-Deck: Seite wie deck.cpp (draw_tile, place_tiles, draw_nav, Lautstärke-Leiste) – noch ohne Designs."""
+    t = theme.settings(cfg)
+    res = theme.build(t, big=True) if t else None
     out = Image.new("RGB", (BIG_W, BIG_H), COL_BG)
+    if res:  # Seitenbild 470x270, am Deck doppelt groß hinter der Kachelfläche
+        out.paste(res["page_img"].resize((BIG_GRID_W, BIG_H), Image.BILINEAR), (0, 0))
+        res = dict(res, style=1 if res["style"] == 2 else res["style"])  # schräger Verlauf: am Big-Deck senkrecht
     d = ImageDraw.Draw(out)
     tw, th = _big_tile_wh(cfg)
     isz = min(tw - 16, th - BIG_LABEL_H - 12)
@@ -159,7 +164,10 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
         if not tl and not lv:
             continue
         x, y, w, h = tile_rect(cfg, i)
-        d.rounded_rectangle((x, y, x + w - 1, y + h - 1), 12, fill=COL_TILE)
+        if res:
+            _glass(out, x, y, w, h, 12, res)
+        else:
+            d.rounded_rectangle((x, y, x + w - 1, y + h - 1), 12, fill=COL_TILE)
         if lv:
             icon, label = lv
         else:
@@ -167,8 +175,18 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
             icon = None if tl.get("text_only") else tile_icon(dict(tl, _slot=i), label)
         if icon is not None:
             icon = icon.convert("RGB").resize((ICON, ICON)) if icon.size != (ICON, ICON) else icon.convert("RGB")
-            icon = theme.deck_icon(icon, cfg).convert("RGB").resize((icon_px, icon_px), Image.BILINEAR)
-            out.paste(icon, (x + (w - icon_px) // 2, y + (h - icon_px) // 2 - BIG_LABEL_H // 2))
+            icon = theme.deck_icon(icon, cfg).convert("RGB")
+            mask = None
+            if res:  # Schlüsselfarbe durchsichtig wie in der Firmware
+                mask = Image.new("L", icon.size, 255)
+                mp, ip = mask.load(), icon.load()
+                for yy in range(ICON):
+                    for xx in range(ICON):
+                        if ip[xx, yy] == KEY:
+                            mp[xx, yy] = 0
+                mask = mask.resize((icon_px, icon_px), Image.NEAREST)
+            icon = icon.resize((icon_px, icon_px), Image.BILINEAR)
+            out.paste(icon, (x + (w - icon_px) // 2, y + (h - icon_px) // 2 - BIG_LABEL_H // 2), mask)
             if label:
                 d.text((x + w // 2, y + h - 6), _fit(d, label, w - 12, font(18)), font=font(18), fill=COL_TEXT,
                        anchor="md")
@@ -182,7 +200,10 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
     if pages > 1:
         y0 = BIG_H - BIG_NAV_H
         for bx in (BIG_GAP, BIG_GRID_W - BIG_GAP - 160):
-            d.rounded_rectangle((bx, y0 + 4, bx + 159, y0 + BIG_NAV_H - 7), 10, fill=COL_TILE)
+            if res:
+                _glass(out, bx, y0 + 4, 160, BIG_NAV_H - 10, 10, res)
+            else:
+                d.rounded_rectangle((bx, y0 + 4, bx + 159, y0 + BIG_NAV_H - 7), 10, fill=COL_TILE)
         d.text((BIG_GAP + 80, y0 + BIG_NAV_H // 2), "<", font=font(24), fill=COL_TEXT, anchor="mm")
         d.text((BIG_GRID_W - BIG_GAP - 80, y0 + BIG_NAV_H // 2), ">", font=font(24), fill=COL_TEXT, anchor="mm")
         nav = ascii_label(title) if title else f"{page + 1} / {pages}"
@@ -198,6 +219,10 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
     d.rounded_rectangle((cx - 14, ky, cx + 13, sy + sh), 14, fill=COL_ACCENT)
     d.ellipse((cx - 22, ky - 22, cx + 21, ky + 21), fill=COL_TEXT)
     d.text((cx, sy + sh + 28), str(v) if volume is not None else "", font=font(18), fill=COL_TEXT, anchor="mm")
+    if res:  # Rand einfarbig (Rand oben)
+        for k, f in enumerate((1, .7, .4)):
+            col = tuple(int(c * f) for c in res["colors"][2])
+            d.rectangle((k, k, BIG_W - 1 - k, BIG_H - 1 - k), outline=col)
     return out
 
 
