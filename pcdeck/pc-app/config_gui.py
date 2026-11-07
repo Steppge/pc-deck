@@ -1773,6 +1773,11 @@ class WifiDialog(_Pane):
         ttk.Checkbutton(net, text="Passwort anzeigen", variable=self.v_show,
                         command=lambda: self.pw_entry.configure(show="" if self.v_show.get() else "•")).pack(
             anchor="w", pady=(4, 0))
+        if is_big(config_store.deck_copy(deck_id)):
+            ttk.Label(net, foreground=DIM, justify="left", wraplength=360,
+                      text="Big-Deck: Das WLAN ist auch das Heimnetz des Displays (CNC). Passwort leer lassen = "
+                           "gespeichertes Passwort behalten, nur koppeln (ab Display-Firmware vom 07.11.2026)."
+                      ).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(f, foreground=DIM, justify="left", wraplength=360,
                   text="Verbinden & koppeln: Das Deck speichert WLAN und Passwort und bekommt einen geheimen "

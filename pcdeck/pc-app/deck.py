@@ -816,9 +816,8 @@ class DeckLink(threading.Thread):
         self._cmd("IMGEND", timeout=10)
 
     def _send_img_data(self, data):
-        """Bilddaten in DATA-Blöcken mit ACK (Flash-Schreiben bremst den Empfang). Big-Deck: 1024 Byte – bei 4096
-        gehen dort nach wenigen Blöcken Bytes verloren (ERR short, FW 38)."""
-        n = 1024 if self.big else 4096
+        """Bilddaten in DATA-Blöcken mit ACK (Flash-Schreiben bremst den Empfang)."""
+        n = 4096
         for k in range(0, len(data), n):
             self._cmd(f"DATA {len(data[k:k + n])}", data[k:k + n], timeout=10)
 

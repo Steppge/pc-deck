@@ -4,7 +4,7 @@ Maße und Regeln wie in firmware/src/main.cpp (tileRect, drawTileTo, fillGlassTo
 
 import os
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 import theme
 from deck import ascii_label, is_big, tile_icon, tile_label
@@ -208,17 +208,46 @@ def _render_big(cfg, page, live, title, selected, accent, volume):
         d.text((BIG_GRID_W - BIG_GAP - 80, y0 + BIG_NAV_H // 2), ">", font=font(24), fill=COL_TEXT, anchor="mm")
         nav = ascii_label(title) if title else f"{page + 1} / {pages}"
         d.text((BIG_GRID_W // 2, y0 + BIG_NAV_H // 2), nav, font=font(22), fill=COL_TEXT, anchor="mm")
-    # Lautstärke-Leiste: Lautsprecher oben, senkrechter Regler, Wert darunter
+    # Lautstärke-Leiste wie deck.cpp (Big-Deck FW 38): Mischpult-Fader – Schlitz 8x440 (y 50..490) mit Skala,
+    # leuchtender Pegel, Kappe 60x40 mit Mittellinie und Rillen; Lautsprecher oben, Wert unten
     cx = BIG_GRID_W + BIG_VOL_W // 2
-    d.polygon([(cx - 12, 22), (cx - 6, 22), (cx + 2, 14), (cx + 2, 40), (cx - 6, 32), (cx - 12, 32)], fill=COL_DIM)
-    sh = BIG_H - 2 * BIG_GAP - 100
-    sy = (BIG_H - sh) // 2
-    d.rounded_rectangle((cx - 14, sy, cx + 13, sy + sh), 14, fill=COL_TILE)
+    d.polygon([(cx - 9, 12), (cx - 4, 12), (cx + 2, 6), (cx + 2, 24), (cx - 4, 18), (cx - 9, 18)], fill=COL_DIM)
+    sy, sh = 50, 440
+    for n in range(11):  # Skala
+        y = sy + n * 44
+        big_tick = n in (0, 5, 10)
+        ln, col = (12, (0x7A, 0x7F, 0x8C)) if big_tick else (7, (0x4A, 0x4E, 0x58))
+        d.rectangle((cx - 10 - ln, y - 1, cx - 11, y), fill=col)
+        d.rectangle((cx + 10, y - 1, cx + 9 + ln, y), fill=col)
+    d.rounded_rectangle((cx - 4, sy, cx + 3, sy + sh - 1), 4, fill=(0x07, 0x08, 0x0B), outline=(0x3A, 0x3E, 0x48))
     v = 50 if volume is None else max(0, min(100, int(volume)))
     ky = sy + sh - sh * v // 100
-    d.rounded_rectangle((cx - 14, ky, cx + 13, sy + sh), 14, fill=COL_ACCENT)
-    d.ellipse((cx - 22, ky - 22, cx + 21, ky + 21), fill=COL_TEXT)
-    d.text((cx, sy + sh + 28), str(v) if volume is not None else "", font=font(18), fill=COL_TEXT, anchor="mm")
+    glow = Image.new("L", (BIG_VOL_W, BIG_H))
+    ImageDraw.Draw(glow).rounded_rectangle((BIG_VOL_W // 2 - 4, ky, BIG_VOL_W // 2 + 3, sy + sh - 1), 4, fill=160)
+    glow = glow.filter(ImageFilter.GaussianBlur(6))
+    out.paste(Image.new("RGB", glow.size, COL_ACCENT), (BIG_GRID_W, 0), glow)
+    d.rounded_rectangle((cx - 4, ky, cx + 3, sy + sh - 1), 4, fill=COL_ACCENT)
+    kx0, ky0 = cx - 30, ky - 20
+    sh_m = Image.new("L", (BIG_VOL_W, BIG_H))
+    ImageDraw.Draw(sh_m).rounded_rectangle((kx0 - BIG_GRID_W, ky0 + 4, kx0 - BIG_GRID_W + 59, ky0 + 43), 5, fill=180)
+    sh_m = sh_m.filter(ImageFilter.GaussianBlur(7))
+    out.paste(Image.new("RGB", sh_m.size, (0, 0, 0)), (BIG_GRID_W, 0), sh_m)
+    cap = Image.new("RGB", (60, 40))
+    cp = ImageDraw.Draw(cap)
+    for r in range(40):
+        cp.line((0, r, 59, r), fill=_mix((0xD9, 0xDC, 0xE3), (0x7C, 0x81, 0x8C), r / 39))
+    cp.rounded_rectangle((0, 0, 59, 39), 5, outline=(0x4A, 0x4E, 0x58))
+    for dy in (-15, -10, -5, 5, 10, 15):  # Rillen: dunkle Linie, darunter helle
+        cp.line((5, 20 + dy, 54, 20 + dy), fill=(0x3A, 0x3D, 0x46))
+        y2 = 21 + dy
+        for xx in range(5, 55):
+            cap.putpixel((xx, y2), _mix(cap.getpixel((xx, y2)), (255, 255, 255), 110 / 255))
+    cp.rectangle((2, 19, 57, 20), fill=(255, 255, 255))  # Mittellinie
+    m = Image.new("L", (60, 40))
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, 59, 39), 5, fill=255)
+    out.paste(cap, (kx0, ky0), m)
+    d = ImageDraw.Draw(out)
+    d.text((cx, BIG_H - 6), str(v) if volume is not None else "", font=font(16), fill=COL_DIM, anchor="md")
     if res:  # Rand einfarbig (Rand oben)
         for k, f in enumerate((1, .7, .4)):
             col = tuple(int(c * f) for c in res["colors"][2])
