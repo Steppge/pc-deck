@@ -381,11 +381,17 @@ def change_app_volume(exe, delta_percent):
         return round(new * 100)
 
 
+VIRTUAL_HINTS = ("vb-audio", "voicemeeter", "cable input")  # virtuelle Kabel, beim Durchschalten auslassen
+
+
 def next_output(device_ids=None, step=1):
     """Standard-Wiedergabegerät reihum wechseln (nur über device_ids, wenn angegeben); gibt das neue Gerät zurück."""
     devs = devices(RENDER)
     if device_ids:
         devs = [d for d in devs if d["id"] in device_ids] or devs
+    else:  # reihum über alle: virtuelle Kabel (VB-Audio, VoiceMeeter) überspringen – sonst hört Discord alles mit
+        devs = [d for d in devs if not any(h in (d["name"] + " " + (d.get("desc") or "")).lower()
+                                           for h in VIRTUAL_HINTS)] or devs
     if not devs:
         return None
     cur = default_id(RENDER)

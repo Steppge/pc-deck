@@ -144,6 +144,9 @@ class App:
                 pystray.MenuItem("Alle Decks neu übertragen", lambda: self.ui_queue.put(("resync", None))),
                 pystray.MenuItem("Mit Windows starten", lambda: self.ui_queue.put(("autostart", None)),
                                  checked=lambda item: autostart_enabled()),
+                pystray.MenuItem("USB-Suche pausieren",
+                                 lambda: self.manager.set_usb_paused(not self.manager.usb_paused),
+                                 checked=lambda item: self.manager.usb_paused),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Beenden", lambda: self.ui_queue.put(("quit", None))),
             ),
@@ -206,6 +209,8 @@ class App:
                 self.window.merge_from_store()
             elif msg and msg.startswith("Kachel gelöscht"):
                 self.window.apply_deletion(self.manager.last_deleted)
+            elif msg and msg.startswith("Kachel verschoben"):
+                self.window.apply_move(self.manager.last_moved)
         offer = getattr(self.manager, "fw_offer", None)
         if msg and "neue Firmware" in msg and offer:  # Abfrage: neue Firmware jetzt installieren?
             self.manager.fw_offer = None

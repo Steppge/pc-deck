@@ -17,6 +17,7 @@ import deckview
 import fwfile
 import iconextract
 import knob
+import moonraker
 import plugin_api
 import theme
 import winaudio
@@ -25,7 +26,7 @@ import winkeys
 import winsecret
 from paths import APP_DIR
 from version import VERSION
-from deck import (FOREGROUND_IGNORE, COLS_RANGE, MAX_PAGES, ROWS_RANGE, grid_ranges, is_big, SOUND_VOLUME_DEFAULT, add_extra_pages,
+from deck import (FOREGROUND_IGNORE, COLS_RANGE, MAX_PAGES, max_pages, ROWS_RANGE, grid_ranges, is_big, SOUND_VOLUME_DEFAULT, add_extra_pages, printer_layout, PRINTER_TITLE,
                   auto_apps,
                   display_opts, empty_page, tile_icon, tile_label)
 
@@ -1726,6 +1727,135 @@ class DisplayDialog(_OkCancel, _Pane):
                 "clock_world": bool(self.v_world.get()), "walkers": bool(self.v_walkers.get())}
 
 
+class PrinterDialog(_OkCancel, _Pane):
+    """Seite „Drucker“: Klipper-3D-Drucker über Moonraker ein-/ausschalten, Adresse; alles, was der Drucker
+    anbietet (Heizungen, Sensoren, Makros …), wird geladen und per Häkchen auf die Seite gelegt.
+    Anordnen: auf der Seite „Drucker“ im Abbild per Maus ziehen."""
+
+    def __init__(self, parent, pr, apply):
+        super().__init__(parent)
+        from plugins import printer
+        self.printer = printer
+        self.title(f"Drucker – {parent.cfg.get('name', '')}")
+        self.results = queue.Queue()
+        self.layout = printer_layout(pr)
+        self.v_on = tk.BooleanVar(value=bool(pr.get("enabled")))
+        self.v_url = tk.StringVar(value=pr.get("url") or moonraker.DEFAULT_URL)
+        self.checks = {}  # Funktion -> BooleanVar
+
+        f = ttk.Frame(self, padding=12)
+        f.pack(fill="both", expand=True)
+        tip(ttk.Checkbutton(f, text="Seite „Drucker“ am Ende dieses Decks zeigen", variable=self.v_on),
+            "Schaltet die automatische Seite „Drucker“ ein oder aus.").pack(anchor="w")
+        tip(ttk.Label(f, text="Moonraker-Adresse:"),
+            "Adresse der Moonraker-Oberfläche im Heimnetz, z. B. http://printer.local/ oder "
+            "http://192.168.x.y:7125/").pack(anchor="w", pady=(10, 0))
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        ttk.Entry(row, textvariable=self.v_url, width=30).pack(side="left", fill="x", expand=True)
+        self.load_btn = tip(ttk.Button(row, text="Vom Drucker laden", command=self._load),
+                            "Fragt den Drucker, was er anbietet (Heizungen, Sensoren, Makros …).")
+        self.load_btn.pack(side="left", padx=(6, 0))
+        self.status = ttk.Label(f, text="", foreground=DIM, wraplength=360, justify="left")
+        self.status.pack(anchor="w", pady=(4, 0))
+
+        self.box = ttk.LabelFrame(f, text="Auf der Seite „Drucker“ zeigen", padding=8)
+        self.box.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(f, foreground=DIM, justify="left", wraplength=360,
+                  text="Anordnen: Seite „Drucker“ im Abbild zeigen und Kacheln mit der Maus ziehen (Lücken "
+                       "bleiben frei). Neu angehakte kommen auf den ersten freien Platz.\n"
+                       "Temperaturen, Z-Versatz, Speed, Flow, Retract, Lüfter: kurz tippen = Drehknopf "
+                       "übernimmt (blauer Rahmen), drehen ändert nur das Ziel, Drehknopf drücken sendet; "
+                       "ohne Drücken verfällt es nach 8 s. Lang tippen: Heizung bzw. Lüfter aus, Speed/Flow "
+                       "100 %.\n"
+                       "Befehle und Makros starten nur mit langem Tippen und sind während eines Drucks "
+                       "gesperrt (außer SET_PAUSE…). Pause nur im Druck, Fortsetzen nur pausiert; Abbrechen: "
+                       "lang tippen, dann Drehknopf drücken = Ja.").pack(anchor="w", pady=(10, 0))
+        b = ttk.Frame(f)
+        b.pack(anchor="e", pady=(14, 0))
+        self._ok_buttons(b, apply)
+        self._fill([(fn, printer.func_name(fn), "Gespeichert") for fn in self.layout if fn], offline=True)
+        self._load()
+
+    def _fill(self, items, offline=False):
+        for w in self.box.winfo_children():
+            w.destroy()
+        on = {fn for fn in self.layout if fn}
+        old = {k: v.get() for k, v in self.checks.items()}
+        self.checks = {}
+        groups = {}
+        for fn, name, grp in items:
+            groups.setdefault(grp, []).append((fn, name))
+        for fn in on:  # gespeicherte, die der Drucker gerade nicht meldet
+            if not any(fn == x for x, _, _ in items):
+                groups.setdefault("Nicht mehr gefunden", []).append((fn, self.printer.func_name(fn)))
+        r = 0
+        for grp, entries in groups.items():
+            ttk.Label(self.box, text=grp, foreground=DIM).grid(row=r, column=0, sticky="w", pady=(4 if r else 0, 0))
+            r += 1
+            for fn, name in entries:
+                v = tk.BooleanVar(value=old.get(fn, fn in on))
+                self.checks[fn] = v
+                ttk.Checkbutton(self.box, text=name, variable=v).grid(row=r, column=0, sticky="w", padx=(10, 0))
+                r += 1
+        if not items and not on:
+            ttk.Label(self.box, text="(noch nichts geladen)").grid(row=0, column=0, sticky="w")
+
+    def _load(self):
+        url = self.v_url.get().strip()
+        self.status.configure(text="Frage den Drucker ...", foreground=DIM)
+        self.load_btn.state(["disabled"])
+
+        def work():
+            try:
+                state, ver = moonraker.info(url)
+                items = self.printer.available(url)
+                self.results.put((f"Klipper {ver}: {state} – {len(items)} Funktionen gefunden.", True, items))
+            except moonraker.PrinterError as e:
+                self.results.put((f"Nicht erreichbar: {e}", False, None))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll_load)
+
+    def _poll_load(self):
+        if not self.winfo_exists():
+            return
+        try:
+            text, ok, items = self.results.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll_load)
+            return
+        self.load_btn.state(["!disabled"])
+        self.status.configure(text=text, foreground="#2e9d50" if ok else "#c05000")
+        if items is not None:
+            self.printer._last_url[0] = self.v_url.get().strip() or moonraker.DEFAULT_URL
+            self._fill(items)
+            self._snapshot_if_first()
+
+    def _snapshot_if_first(self):
+        """Neu geladene Liste ist keine Änderung des Nutzers (für die Nachfrage beim Verlassen)."""
+        if not getattr(self, "_loaded_once", False):
+            self._loaded_once = True
+            self._snapshot()
+
+    def _current(self, strict=False):
+        url = self.v_url.get().strip()
+        chosen = [fn for fn, v in self.checks.items() if v.get()]
+        if strict and self.v_on.get() and not chosen:
+            messagebox.showerror("Drucker", "Bitte mindestens eine Kachel anhaken.", parent=self)
+            return None
+        layout = [fn if fn in chosen else None for fn in self.layout]
+        for fn in chosen:
+            if fn not in layout:
+                if None in layout:
+                    layout[layout.index(None)] = fn
+                else:
+                    layout.append(fn)
+        while layout and layout[-1] is None:
+            layout.pop()
+        return {"enabled": bool(self.v_on.get()), "url": url or moonraker.DEFAULT_URL, "layout": layout}
+
+
 # ======================================================================= WLAN-Dialog
 class WifiDialog(_Pane):
     """WLAN des Decks einrichten und koppeln (nur per USB), Status anzeigen, ein-/ausschalten."""
@@ -2629,6 +2759,9 @@ class ConfigWindow(tk.Toplevel):
                   "Sounds anhaken: daraus entsteht die Seite „Soundboard“ am Ende des Decks.", "sound")
         self._nav(nav, "⌂   SmartHome", self.edit_smarthome,
                   "Bosch Smart Home Controller koppeln: Kacheln für Rollladen und Licht.", "home")
+        self._nav(nav, "▤   Drucker", self.edit_printer,
+                  "Klipper-3D-Drucker (Moonraker): Seite „Drucker“ mit Bett-Temperatur, Homing, Z-Versatz, "
+                  "Z-Tilt, Geschwindigkeit und Retract.", "printer")
         ttk.Label(nav, text="Deck", style="PanelDim.TLabel").pack(anchor="w", padx=10, pady=(14, 2))
         self._nav(nav, "◐   Design", self.edit_design, "Aussehen des Decks: fertige Designs oder eigenes.",
                   "design")
@@ -2704,7 +2837,10 @@ class ConfigWindow(tk.Toplevel):
         self.tools = tools
         self.canvas = tk.Label(frame, bd=0, bg="#000000", cursor="hand2")
         self.canvas.pack()
-        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._drag = None
         self.canvas.bind("<Button-3>", self._on_right_click)
         if HAVE_DND:
             self.canvas.drop_target_register(DND_FILES)
@@ -2806,7 +2942,10 @@ class ConfigWindow(tk.Toplevel):
         link = self.manager.link(self.deck_id)
         live = {}
         if link and link.visible_page == self.page:
-            live = {i: v for (p, i), v in dict(getattr(link, "live_view", {})).items() if p == self.page}
+            # nur Plätze, auf denen jetzt wirklich eine Live-Kachel liegt (nach Verschieben/Leeren nichts Altes zeigen)
+            tiles = view["pages"][self.page] if self.page < len(view["pages"]) else []
+            live = {i: v for (p, i), v in dict(getattr(link, "live_view", {})).items()
+                    if p == self.page and i < len(tiles) and tiles[i] and plugin_api.get(tiles[i]).live}
         title = (view.get("page_titles") or {}).get(self.page)
         self._base = deckview.render(view, self.page, live=live, title=title, selected=self.selected,
                                      accent=C["accent_rgb"], volume=getattr(link, "vol_sent", None))
@@ -2851,6 +2990,153 @@ class ConfigWindow(tk.Toplevel):
             self.goto_page(1)
         elif i is not None:
             self.select_tile(i)
+
+    # ---------------------------------------------------------- Kachel mit der Maus verschieben
+    def _raw_slot(self, x, y):
+        """Platz unter der Maus ohne Hinweisfenster (-1/-2 = Pfeile der Navigationsleiste, None = nichts)."""
+        return deckview.slot_at(self._view_cfg(), x / self.scale, y / self.scale)
+
+    def _printer_slot(self, page, i):
+        """Platz auf der Seite „Drucker“ -> Index in cfg["printer"]["layout"] (sonst None)."""
+        view = self._view_cfg()
+        titles = view.get("page_titles") or {}
+        pages = sorted(p for p, t in titles.items() if t == PRINTER_TITLE)
+        if page not in pages or i is None or i < 0:
+            return None
+        return (page - pages[0]) * view["cols"] * view["rows"] + i
+
+    def _on_press(self, ev):
+        i = self._raw_slot(ev.x, ev.y)
+        ok = self._own() and i is not None and i >= 0 and bool(self.cfg["pages"][self.page][i])
+        if not ok and self._printer_slot(self.page, i) is not None:
+            view = self._view_cfg()
+            ok = i < len(view["pages"][self.page]) and bool(view["pages"][self.page][i])
+        self._drag = {"x": ev.x, "y": ev.y, "src": (self.page, i) if ok else None, "active": False,
+                      "flip": None}
+
+    def _on_motion(self, ev):
+        d = self._drag
+        if not d or not d["src"]:
+            return
+        if not d["active"]:
+            if abs(ev.x - d["x"]) + abs(ev.y - d["y"]) < 8:
+                return
+            keep = self.pane_key == "printer" and self._printer_slot(*d["src"]) is not None
+            if not self._leave_editor() or (not keep and not self._leave_pane()):
+                self._drag = None
+                return
+            d["active"] = True
+            if not keep:
+                self.selected = None
+                self._clear_side()
+                self._set_nav("tiles")
+                self._show_side_hint()
+            p, i = d["src"]
+            self.render()
+            x, y, w, h = deckview.tile_rect(self._view_cfg(), i)  # schon in Abbild-Koordinaten (auch Big-Deck)
+            d["ghost"] = self._base.crop((x, y, x + w, y + h)).convert("RGBA")
+            d["ghost"].putalpha(170)
+            self.canvas.configure(cursor="fleur")
+        d["mx"], d["my"] = ev.x, ev.y
+        t = self._raw_slot(ev.x, ev.y)
+        # über "<" / ">" halten: nach 0,6 s blättern (nur eigene Seiten)
+        if t in (-1, -2):
+            if not d["flip"]:
+                d["flip"] = self.after(600, lambda dd=d, step=(-1 if t == -1 else 1): self._drag_flip(dd, step))
+        elif d["flip"]:
+            self.after_cancel(d["flip"])
+            d["flip"] = None
+        self._drag_draw(t)
+
+    def _drag_flip(self, d, step):
+        d["flip"] = None
+        if self._drag is not d:
+            return
+        own = len(self.cfg["pages"])
+        if own > 1:
+            self.page = (self.page + step) % own
+            self.render()
+            self._drag_draw(None)
+
+    def _drag_draw(self, target):
+        """Abbild mit markiertem Ziel und der Kachel an der Maus (halbdurchsichtig)."""
+        d = self._drag
+        base = self._base.copy().convert("RGBA")
+        if target is not None and target >= 0 and (self._own() or self._printer_slot(self.page, target) is not None):
+            x, y, w, h = deckview.tile_rect(self._view_cfg(), target)
+            from PIL import ImageDraw
+            dr = ImageDraw.Draw(base)
+            for n in range(3):
+                dr.rounded_rectangle((x + n, y + n, x + w - 1 - n, y + h - 1 - n), 10, outline=C["accent_rgb"])
+        g = d["ghost"]
+        gx = int(d["mx"] / self.scale - g.size[0] / 2)
+        gy = int(d["my"] / self.scale - g.size[1] / 2)
+        base.paste(g, (gx, gy), g)  # paste schneidet am Rand selbst ab
+        sc = self.scale
+        self._photo = ImageTk.PhotoImage(base.convert("RGB").resize((int(base.size[0] * sc),
+                                                                       int(base.size[1] * sc)), Image.BILINEAR))
+        self.canvas.configure(image=self._photo)
+
+    def _on_release(self, ev):
+        d, self._drag = self._drag, None
+        self.canvas.configure(cursor="hand2")
+        if d and d.get("flip"):
+            self.after_cancel(d["flip"])
+        if not d or not d["active"]:
+            self._on_click(ev)  # kein Ziehen: normaler Klick
+            return
+        t = self._raw_slot(ev.x, ev.y)
+        sp, si = d["src"]
+        a = self._printer_slot(sp, si)
+        if a is not None:  # Kachel der Drucker-Seite: nur innerhalb der Drucker-Seite(n)
+            b = self._printer_slot(self.page, t)
+            if b is not None and a != b:
+                pr = dict(self.cfg.get("printer") or {})
+                layout = printer_layout(pr)
+                layout += [None] * (max(a, b) + 1 - len(layout))
+                layout[a], layout[b] = layout[b], layout[a]
+                while layout and layout[-1] is None:
+                    layout.pop()
+                pr["layout"] = layout
+                self.cfg["printer"] = pr
+                self._commit("printer")
+                pane = self.pane
+                if isinstance(pane, PrinterDialog) and pane.winfo_exists():
+                    was = pane.changed()
+                    pane.layout = list(layout)  # sonst würde OK im Bereich die alte Anordnung zurückschreiben
+                    if not was:
+                        pane._snapshot()
+            self.render()
+            return
+        if t is None or t < 0 or not self._own() or (self.page, t) == (sp, si):
+            self.render()
+            return
+        self.move_tile(sp, si, self.page, t)
+
+    def move_tile(self, sp, si, tp, ti):
+        """Kachel von (sp, si) nach (tp, ti); ist das Ziel belegt, tauschen beide die Plätze."""
+        pages = self.cfg["pages"]
+        a, b = pages[sp][si], pages[tp][ti]
+        pages[tp][ti], pages[sp][si] = a, b
+        moved = {(sp, si): (tp, ti)}
+        if b:
+            moved[(tp, ti)] = (sp, si)
+        self._move_knob_refs(moved)
+        self._mark_dirty()
+        self.render()
+
+    def _move_knob_refs(self, moved):
+        """Drehknopf-Belegungen, die auf Seite:Platz zeigen (Kachel auslösen/einstellen), mitziehen."""
+        apps = knob.settings(self.cfg)["apps"]
+        changed = False
+        for p in apps.values():
+            for key in ("tile_press", "tile_long", "tile_double", "tile_rot"):
+                ref = knob.parse_tile(p.get(key, "")) if p.get(key) else None
+                if ref and ref in moved:
+                    p[key] = "%d:%d" % moved[ref]
+                    changed = True
+        if changed:
+            self.cfg["knob"] = {"apps": apps}
 
     def _on_right_click(self, ev):
         i = self._slot_from_event(ev.x, ev.y)
@@ -3199,6 +3485,22 @@ class ConfigWindow(tk.Toplevel):
             self.cfg["pages"][p][i] = None
             self.render()
 
+    def apply_move(self, moved):
+        """Am Deck verschobene Kachel (ab FW 40) auch im offenen Fenster tauschen (nur wenn beide Plätze dort
+        unverändert sind), Drehknopf-Verweise ziehen mit wie beim Verschieben mit der Maus."""
+        if not moved or not self.winfo_exists():
+            return
+        deck_id, p, a, b, ta, tb = moved
+        pages = self.cfg["pages"]
+        if deck_id != self.deck_id or p >= len(pages) or pages[p][a] != ta or pages[p][b] != tb:
+            return
+        pages[p][a], pages[p][b] = tb, ta
+        ref = {(p, a): (p, b)}
+        if tb:
+            ref[(p, b)] = (p, a)
+        self._move_knob_refs(ref)
+        self.render()
+
     def _commit(self, *keys):
         """Diese Einstellungen sofort speichern und ans Deck geben. Andere, noch ungespeicherte Änderungen
         (z. B. Kacheln) bleiben ungespeichert."""
@@ -3273,23 +3575,32 @@ class ConfigWindow(tk.Toplevel):
 
     def _extra_info(self):
         title = (self._view_cfg().get("page_titles") or {}).get(self.page, "")
-        where = "„Soundboard“" if title == "Soundboard" else "„SmartHome“"
+        where = f"„{title}“" if title in ("Soundboard", "SmartHome", "Drucker") else "„SmartHome“"
         messagebox.showinfo("PC-Deck", f"Die Seite „{title}“ entsteht automatisch – ändern unter {where} links.",
                             parent=self)
 
     def goto_page(self, d):
         if not self._leave_editor():
             return
+        view = self._view_cfg()
+        new = (self.page + d) % len(view["pages"])
+        key = self.EXTRA_PANES.get((view.get("page_titles") or {}).get(new))
+        if key and key == self.pane_key and self.pane is not None:  # z. B. Drucker-Seite 1 -> 2: Bereich bleibt
+            self.page = new
+            self.render()
+            return
         auto = self.pane_key == "auto"
         if not self._leave_pane():
             return
-        self.page = (self.page + d) % len(self._view_cfg()["pages"])
+        self.page = new
         self.selected = None
         self._clear_side()
         self._set_nav("tiles")
         self._show_side_hint()
         self.render()
-        if auto and self._own():
+        if key:
+            self._open_extra(key, jump=False)  # automatische Seite: passender Bereich links
+        elif auto and self._own():
             self.edit_auto()
 
     def add_page(self):
@@ -3298,8 +3609,12 @@ class ConfigWindow(tk.Toplevel):
         self._add_page()
 
     def _add_page(self):
-        if len(self.cfg["pages"]) >= MAX_PAGES:
-            messagebox.showinfo("PC-Deck", f"Maximal {MAX_PAGES} Seiten.", parent=self)
+        stored = self.config_store.deck_copy(self.deck_id) or {}
+        self.cfg["pages_max"] = stored.get("pages_max", self.cfg.get("pages_max", MAX_PAGES))
+        mx = max_pages(self.cfg)
+        if len(self.cfg["pages"]) >= mx:
+            messagebox.showinfo("PC-Deck", f"Maximal {mx} Seiten" + (" (16 ab Firmware 1.039)." if mx < 16 else "."),
+                                parent=self)
             return
         self.cfg["auto_apps"] = auto_apps(self.cfg)
         self._hidden().insert(self.page + 1, [])
@@ -3437,11 +3752,45 @@ class ConfigWindow(tk.Toplevel):
             return
         self._open_pane("wifi", lambda: WifiDialog(self, self.manager, self.config_store, self.deck_id))
 
-    def edit_soundboard(self):
-        self._open_pane("sound", lambda: SoundboardDialog(self))
+    # Automatische Seiten: Titel <-> Bereich links (Auswahl links zeigt die Seite, Blättern wählt links)
+    EXTRA_PANES = {"Soundboard": "sound", "SmartHome": "home", "Drucker": "printer"}
 
-    def edit_smarthome(self):
+    def _show_extra_page(self, key):
+        """Nach dem Öffnen des Bereichs `key`: erste Seite mit diesem Namen zeigen – im Abbild und am Deck."""
+        if self.pane_key != key:
+            return  # Bereich nicht geöffnet (z. B. Wechsel abgebrochen)
+        view = self._view_cfg()
+        titles = view.get("page_titles") or {}
+        pages = sorted(p for p, t in titles.items() if self.EXTRA_PANES.get(t) == key)
+        if not pages:
+            return  # Seite gibt es (noch) nicht
+        if self.page not in pages:
+            self.page = pages[0]
+            self.render()
+        link = self.manager.link(self.deck_id)
+        if link:
+            link.goto_page(self.page)
+
+    def _open_extra(self, key, jump=True):
+        {"sound": self.edit_soundboard, "home": self.edit_smarthome, "printer": self.edit_printer}[key](jump)
+
+    def edit_soundboard(self, jump=True):
+        self._open_pane("sound", lambda: SoundboardDialog(self))
+        if jump:
+            self._show_extra_page("sound")
+
+    def edit_smarthome(self, jump=True):
         self._open_pane("home", lambda: BoschDialog(self))
+        if jump:
+            self._show_extra_page("home")
+
+    def edit_printer(self, jump=True):
+        def apply(pr):
+            self.cfg["printer"] = pr
+            self._commit("printer")
+        self._open_pane("printer", lambda: PrinterDialog(self, self.cfg.get("printer") or {}, apply))
+        if jump:
+            self._show_extra_page("printer")
 
     def edit_firmware(self, auto=False):
         if is_big(self.cfg):

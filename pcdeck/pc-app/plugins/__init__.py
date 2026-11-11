@@ -11,3 +11,4 @@ from . import keys  # noqa: F401
 from . import obs  # noqa: F401
 from . import bosch  # noqa: F401
 from . import sound  # noqa: F401
+from . import printer  # noqa: F401

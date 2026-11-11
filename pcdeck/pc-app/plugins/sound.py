@@ -148,7 +148,9 @@ def _note(d, color):
 class Sound(LiveTileType):
     id = "sound"
     name = "Sound abspielen (Soundboard)"
-    fields = [Field("file", "Audiodatei (MP3, WAV, OGG, FLAC):", kind="file"),
+    fields = [Field("use_hint", "Am Deck: tippen = abspielen (läuft er schon: wieder von vorne), "
+                                "lang tippen = stoppen.", kind="info", default=""),
+              Field("file", "Audiodatei (MP3, WAV, OGG, FLAC):", kind="file"),
               Field("search", "Sounds suchen und herunterladen ...", kind="tool", default=_open_search),
               Field("sources", "Freie Sounds finden ...", kind="links", default=SOUND_SOURCES),
               Field("volume", "Lautstärke:", kind="choice", default="50", choices=VOLUMES, width=12),
@@ -195,24 +197,28 @@ class Sound(LiveTileType):
     def on_press(self, tile, ctx):
         sp = _sp()
         key = ctx.key if ctx else tile.get("file", "")
-        if sp.progress(key) is not None:  # läuft -> stoppen
-            sp.stop(key)
+        sp.stop(key)  # läuft er schon: von vorne (mehrmals tippen = immer wieder neu)
+        devices = [tile.get("device", "")] + ([tile["device2"]] if tile.get("device2") else [])
+        try:
+            missing = sp.play(key, tile.get("file", ""), int(tile.get("volume", "50")) / 100, devices,
+                              stop_others=tile.get("mode") == "stop")
+        except FileNotFoundError:
+            missing, msg = None, "Sounddatei fehlt"
+        except Exception as e:
+            log.error("Soundboard: %s", e)
+            missing, msg = None, "Sound nicht abspielbar"
         else:
-            devices = [tile.get("device", "")] + ([tile["device2"]] if tile.get("device2") else [])
-            try:
-                missing = sp.play(key, tile.get("file", ""), int(tile.get("volume", "50")) / 100, devices,
-                                  stop_others=tile.get("mode") == "stop")
-            except FileNotFoundError:
-                missing, msg = None, "Sounddatei fehlt"
-            except Exception as e:
-                log.error("Soundboard: %s", e)
-                missing, msg = None, "Sound nicht abspielbar"
-            else:
-                msg = None
-                if missing:
-                    msg = "Virtuelles Kabel fehlt" if tile.get("device2") in missing else "Ausgabegeraet fehlt"
-            if msg and ctx and ctx.link:
-                ctx.link.request_osd(None, msg)
+            msg = None
+            if missing:
+                msg = "Virtuelles Kabel fehlt" if tile.get("device2") in missing else "Ausgabegeraet fehlt"
+        if msg and ctx and ctx.link:
+            ctx.link.request_osd(None, msg)
+        if ctx and ctx.link:
+            ctx.link.request_live_update(0.1)
+
+    def on_long_press(self, tile, ctx):
+        """Lang tippen: diesen Sound stoppen."""
+        _sp().stop(ctx.key if ctx else tile.get("file", ""))
         if ctx and ctx.link:
             ctx.link.request_live_update(0.1)
 

@@ -52,7 +52,9 @@ def migrate_legacy():
             shutil.copytree(src, os.path.join(APP_DIR, name), dirs_exist_ok=True)
     log.info("Konfiguration von %s nach %s übernommen", LEGACY_DIR, APP_DIR)
 
-MAX_PAGES = 8
+MAX_PAGES = 8          # Decks mit älterer Firmware (und Big-Deck)
+MAX_PAGES_NEW = 16     # ab Firmware FW_MANY_PAGES
+FW_MANY_PAGES = 39
 COLS_RANGE = (2, 5)
 ROWS_RANGE = (1, 3)
 # Big-Deck (9"-Display mit ESP32-P4, 1024x600, Firmware im grblHAL-Display): größeres Raster, Lautstärke-Regler,
@@ -252,24 +254,39 @@ def build_payload(cfg):
 # ======================================================================= SmartHome-Seite
 SMARTHOME_TITLE = "SmartHome"
 SOUNDBOARD_TITLE = "Soundboard"
+PRINTER_TITLE = "Drucker"
 SOUND_VOLUME_DEFAULT = "50"  # Lautstärke eines Sounds ohne eigene Einstellung (%)
 
 
 def add_extra_pages(cfg):
-    """Automatische Seiten hinter den eigenen anhängen: erst Soundboard, dann SmartHome.
+    """Automatische Seiten hinter den eigenen anhängen: erst Soundboard, dann SmartHome, dann Drucker.
     cfg["own_pages"] = Anzahl der eigenen Seiten, cfg["page_titles"] = {seite: Name in der Navigationsleiste}."""
     cfg["own_pages"] = len(cfg["pages"])
     cfg["page_titles"] = {}
+    # SmartHome und Drucker behalten ihren Platz: das Soundboard bekommt nur, was danach noch frei ist
+    probe = dict(cfg, pages=[], page_titles={})
+    add_smarthome_pages(probe)
+    add_printer_pages(probe)
+    cfg["_page_limit"] = max(len(cfg["pages"]), max_pages(cfg) - len(probe["pages"]))
     add_soundboard_pages(cfg)
+    cfg.pop("_page_limit", None)
     add_smarthome_pages(cfg)
+    add_printer_pages(cfg)
     return cfg
 
 
+def max_pages(cfg):
+    """Höchstzahl Seiten dieses Decks: 16 ab Firmware 39 (merkt sich die App beim Verbinden), sonst 8."""
+    return MAX_PAGES_NEW if not is_big(cfg) and (cfg or {}).get("pages_max", MAX_PAGES) >= MAX_PAGES_NEW \
+        else MAX_PAGES
+
+
 def _append_pages(cfg, tiles, title):
-    """Kacheln auf neue Seiten verteilen (höchstens bis MAX_PAGES Seiten insgesamt)."""
+    """Kacheln auf neue Seiten verteilen (höchstens bis zur Seitenzahl des Decks bzw. cfg["_page_limit"])."""
     per = cfg["cols"] * cfg["rows"]
+    limit = cfg.get("_page_limit") or max_pages(cfg)
     for k in range(0, len(tiles), per):
-        if len(cfg["pages"]) >= MAX_PAGES:
+        if len(cfg["pages"]) >= limit:
             break
         page = empty_page(cfg["cols"], cfg["rows"])
         for j, t in enumerate(tiles[k:k + per]):
@@ -307,6 +324,66 @@ def add_smarthome_pages(cfg):
               "label": ""} for d in devs]
     _append_pages(cfg, tiles, SMARTHOME_TITLE)
     return cfg
+
+
+def printer_layout(pr):
+    """Plätze der Drucker-Seite(n): Liste aus Funktion (siehe plugins/printer) oder None (Lücke)."""
+    from plugins import printer
+    if "layout" in pr:
+        return list(pr.get("layout") or [])
+    return list(pr.get("funcs") or [f for f, _, _ in printer.OFFLINE_FUNCS])  # bis App 1.046
+
+
+def add_printer_pages(cfg):
+    """Seite(n) „Drucker“ (Klipper/Moonraker), wenn cfg["printer"]["enabled"]: die Kacheln nach
+    cfg["printer"]["layout"] (Lücken bleiben frei) mit der Adresse aus cfg["printer"]["url"]."""
+    from plugins import printer
+    pr = cfg.get("printer") or {}
+    if not pr.get("enabled"):
+        return cfg
+    url = pr.get("url") or printer.moonraker.DEFAULT_URL
+    printer._last_url[0] = url
+    layout = printer_layout(pr)
+    while layout and not layout[-1]:
+        layout.pop()
+    if not layout:
+        return cfg
+    tiles = [{"type": "printer", "func": f, "url": url, "label": ""} if f else None for f in layout]
+    _append_pages(cfg, tiles, PRINTER_TITLE)
+    return cfg
+
+
+def printer_deck_lines(cfg):
+    """Drucker-Seite(n) für den Betrieb ohne App (ab FW 38): Zeilen für PRINTER BEGIN/L/END oder None.
+    cfg = Konfiguration so, wie das Deck sie zeigt (add_extra_pages)."""
+    import socket
+    import urllib.parse
+    from plugins import printer
+    pages = sorted(p for p, t in (cfg.get("page_titles") or {}).items() if t == PRINTER_TITLE)
+    pr = cfg.get("printer") or {}
+    if not pages or not pr.get("enabled"):
+        return None
+    url = printer.moonraker.base(pr.get("url"))
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or "printer.local"
+    lines = [f"host {host}", f"port {parts.port or 80}", f"pages {pages[0]} {len(pages)}"]
+    try:
+        lines.append("ip " + socket.getaddrinfo(host, parts.port or 80, socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
+    except (OSError, IndexError):
+        pass
+    try:
+        maxt = printer.moonraker.objects(url)[1]
+        for key, name, cap in (("maxbed", "heater_bed", 110), ("maxnozzle", "extruder", 280)):
+            if name in maxt:  # wie in der App: höchstens die feste Grenze
+                lines.append(f"{key} {round(min(cap, maxt[name]))}")
+    except printer.moonraker.PrinterError:
+        pass
+    per = cfg["cols"] * cfg["rows"]
+    for p in pages:
+        for i, t in enumerate(cfg["pages"][p]):
+            if t and t.get("type") == "printer" and t.get("func"):
+                lines.append(f"t {(p - pages[0]) * per + i} {t['func']}"[:100])
+    return lines
 
 
 def app_title(cfg, page, exe):
@@ -609,7 +686,7 @@ class DeckLink(threading.Thread):
                 return True
             if line.startswith("ERR"):
                 raise DeckRefused(f"Deck meldet Fehler bei '{text.split()[0]}': {line}")
-            if line.startswith(("PRESS ", "LONG ", "SHOW ", "DEL ", "ROT", "KNOB", "VOL ")):
+            if line.startswith(("PRESS ", "LONG ", "SHOW ", "DEL ", "MOVE ", "ROT", "KNOB", "VOL ")):
                 self.backlog.append(line)  # nach der Übertragung abarbeiten
             elif collect is not None:
                 collect.append(line)
@@ -717,10 +794,19 @@ class DeckLink(threading.Thread):
 
     def _send_icon(self, p, i, raw):
         z = iconextract.pack_icon(raw) if self.fw >= 22 else None
-        if z:  # gepackt: weniger Speicher im Deck und schneller übertragen (ab FW 22)
-            self._cmd(f"ICONZ {p} {i} {len(z)}", z)
-        else:
-            self._cmd(f"ICON {p} {i} {len(raw)}", raw)
+        try:
+            if z:  # gepackt: weniger Speicher im Deck und schneller übertragen (ab FW 22)
+                self._cmd(f"ICONZ {p} {i} {len(z)}", z)
+            else:
+                self._cmd(f"ICON {p} {i} {len(raw)}", raw)
+        except DeckRefused as e:
+            if "ERR full" not in str(e) and "ERR fs" not in str(e):
+                raise
+            if not getattr(self, "full_warned", False):  # Speicher voll: einmal melden, Kachel ohne Icon
+                self.full_warned = True
+                name = (self.manager.config.deck_view(self.deck_id) or {}).get("name", self.deck_id)
+                self.manager.notify(f"{name}: Speicher des Decks voll – nicht alle Icons passen. "
+                                    "Weniger Seiten oder Sounds verwenden.")
 
     def _sync_changed(self, cfg, tiles, digest):
         """Nur geänderte Kacheln schicken (ab FW 28): Raster gleich und bekannt, was im Deck liegt.
@@ -743,6 +829,7 @@ class DeckLink(threading.Thread):
             self._cmd(f"TSET {p} {i} {1 if icon else 0} {label}")
         for k in gone + changed:
             self.live_sent.pop(k, None)  # Deck hat die Kachel neu gezeichnet
+            self.live_view.pop(k, None)  # Abbild in der App: alter Live-Inhalt gehört nicht mehr hierher
         self._cmd(f"LHASH {digest}")
         self.deck_hash = digest
         self.on_deck = (grid, new)
@@ -776,6 +863,7 @@ class DeckLink(threading.Thread):
             self.manual_page = 0
             self.auto_active = False
         self.live_sent.clear()
+        self.live_view.clear()
         self.ghost = None
         self.next_live = 0.0
         self.titles_sent = {}  # BEGIN hat die Namen im Deck gelöscht
@@ -1052,6 +1140,30 @@ class DeckLink(threading.Thread):
         self.live_sent.clear()
         self.next_live = 0.0
 
+    def _send_printer(self):
+        """Drucker-Seite für den Betrieb ohne App ans Deck (ab FW 38; nur Deck 2 nutzt sie)."""
+        if self.fw < 38 or self.big:
+            return
+        cfg = self.manager.config.deck_view(self.deck_id)
+        lines = printer_deck_lines(cfg) if cfg else None
+        digest = hashlib.md5(repr(lines).encode()).hexdigest()
+        if digest == getattr(self, "printer_sent", None):
+            return
+        if lines is None:
+            self._cmd("PRINTER CLEAR")
+        else:
+            self._cmd("PRINTER BEGIN")
+            for line in lines:
+                self._cmd("PRINTER L " + line.encode("utf-8").hex())
+            self._cmd("PRINTER END")
+        self.printer_sent = digest
+
+    def _send_printer_safe(self):
+        try:
+            self._send_printer()
+        except DeckRefused as e:  # ältere Firmware o. Ä.: Drucker-Betrieb ohne App gibt es dann nicht
+            log.info("Drucker-Seite nicht ans Deck: %s", e)
+
     def _send_titles(self):
         """Namen in der Navigationsleiste (ab FW 17): Soundboard- und SmartHome-Seiten fest, eine Automatik-Seite
         zeigt den Namen des Programms, das sie ausgelöst hat. Alle anderen Seiten zeigen ihre Nummer."""
@@ -1166,7 +1278,7 @@ class DeckLink(threading.Thread):
 
     def _locked(self, line):
         """PC gesperrt: Tipper, Löschen, Plus-Kachel und Drehknopf lösen nichts aus (nur Blättern am Deck)."""
-        if not line.startswith(("PRESS ", "LONG ", "DEL ", "ROT", "KNOB", "VOL ")) or not winctl.is_locked():
+        if not line.startswith(("PRESS ", "LONG ", "DEL ", "MOVE ", "ROT", "KNOB", "VOL ")) or not winctl.is_locked():
             return False
         now = time.time()
         if now - self.locked_notice > 2.0:  # Hinweis höchstens alle 2 s (schnelles Drehen)
@@ -1202,6 +1314,12 @@ class DeckLink(threading.Thread):
             try:
                 _, p, i = line.split()
                 self._delete_tile(int(p), int(i))
+            except ValueError:
+                return
+        elif line.startswith("MOVE "):
+            try:
+                _, p, a, b = line.split()
+                self._move_tile(int(p), int(a), int(b))
             except ValueError:
                 return
         elif line.startswith(("PRESS ", "LONG ")):
@@ -1261,6 +1379,38 @@ class DeckLink(threading.Thread):
         self.manager.notify(f"Kachel gelöscht: {tile_label(tile)} (Seite {p + 1})")
         self.jobs.put(("sync", False))
 
+    def _move_tile(self, p, a, b):
+        """Am Deck verschoben (ab FW 40): Kachel von Platz a nach b, ein belegtes Ziel tauscht (wie mit der Maus).
+        Drehknopf-Verweise auf die Plätze ziehen mit. SmartHome- und Drucker-Seiten bleiben unverändert."""
+        cfg = self.manager.config
+        with cfg.lock:
+            d = cfg.data.get("decks", {}).get(self.deck_id)
+            pages = (d or {}).get("pages") or []
+            if p >= len(pages) or not (0 <= a < len(pages[p])) or not (0 <= b < len(pages[p])) or a == b:
+                return
+            ta, tb = pages[p][a], pages[p][b]
+            if not ta:
+                return
+            pages[p][a], pages[p][b] = tb, ta
+            moved = {(p, a): (p, b)}
+            if tb:
+                moved[(p, b)] = (p, a)
+            apps = knob.settings(d)["apps"]
+            changed = False
+            for pre in apps.values():
+                for key in ("tile_press", "tile_long", "tile_double", "tile_rot"):
+                    ref = knob.parse_tile(pre.get(key, "")) if pre.get(key) else None
+                    if ref and ref in moved:
+                        pre[key] = "%d:%d" % moved[ref]
+                        changed = True
+            if changed:
+                d["knob"] = {"apps": apps}
+            cfg.save()
+            self.manager.last_moved = (self.deck_id, p, a, b, copy.deepcopy(ta), copy.deepcopy(tb))
+        log.info("Kachel verschoben (Seite %d): Platz %d -> %d", p + 1, a + 1, b + 1)
+        self.manager.notify(f"Kachel verschoben: {tile_label(ta)} (Seite {p + 1})")
+        self.jobs.put(("sync", False))
+
     def _add_from_plus(self, p, i):
         """Plus-Kachel angetippt: vorgeschlagenes Programm fest auf diesem Platz speichern."""
         sug = current_suggestion()
@@ -1275,6 +1425,15 @@ class DeckLink(threading.Thread):
         plugin_api.press(tile, ctx, long)
         if plugin_api.get(tile).live:
             self.request_live_update()  # Änderung (z. B. Stoppuhr gestartet) sofort zeigen
+
+    def _remember_page_limit(self):
+        """Seiten-Höchstzahl des Decks in der Konfiguration merken (16 ab Firmware 39), auch für das Fenster."""
+        want = MAX_PAGES_NEW if self.fw >= FW_MANY_PAGES else MAX_PAGES
+        with self.manager.config.lock:
+            d = self.manager.config.data.get("decks", {}).get(self.deck_id)
+            if d is not None and not is_big(d) and d.get("pages_max", MAX_PAGES) != want:
+                d["pages_max"] = want
+                self.manager.config.save()
 
     def _reset_foreign_wlan(self):
         """Deck per USB an einem PC ohne Kopplung (anderer PC, Neuinstallation): WLAN, Passwort und
@@ -1296,6 +1455,7 @@ class DeckLink(threading.Thread):
 
     def run(self):
         try:
+            self._remember_page_limit()
             self._reset_foreign_wlan()
             self._sync(False)
             self._sync_theme()
@@ -1303,6 +1463,7 @@ class DeckLink(threading.Thread):
             self._send_titles()
             self._send_name()
             self._send_options()
+            self._send_printer_safe()
             self._firmware_hint()
             self._wifi_diag()
             while self.alive:
@@ -1314,6 +1475,7 @@ class DeckLink(threading.Thread):
                         self._send_titles()
                         self._send_name()
                         self._send_options()
+                        self._send_printer_safe()
                     elif job == "titles":
                         self._send_titles()
                     elif job == "opts":
@@ -1394,8 +1556,12 @@ class DeckManager(threading.Thread):
         self.on_change = on_change or (lambda msg=None: None)
         self.links = {}          # deck_id -> DeckLink
         self.last_deleted = None  # (deck_id, seite, platz, kachel) – fürs Konfigurationsfenster
+        self.last_moved = None    # (deck_id, seite, von, nach, kachel von, kachel nach) – ebenso
         self.busy_ports = set()
         self.not_deck = set()     # (port, hwid) ohne Deck-Antwort – nicht ständig neu öffnen
+        self.fails = {}           # (port, hwid) -> Suchläufe ohne Deck-Antwort
+        self.retry_at = {}        # (port, hwid) -> bekannter Deck-Port, der nicht antwortet: erst dann wieder fragen
+        self.usb_paused = False   # Tray „USB-Suche pausieren“: keinen COM-Port öffnen
         self.lock = threading.Lock()
         self.running = True
         self.rescan = threading.Event()
@@ -1423,6 +1589,8 @@ class DeckManager(threading.Thread):
                 del self.links[link.deck_id]
             self.busy_ports.discard(link.port)
             self.not_deck = {k for k in self.not_deck if k[0] != link.port}  # Deck startet evtl. gerade neu
+            self.fails = {k: v for k, v in self.fails.items() if k[0] != link.port}
+            self.retry_at = {k: v for k, v in self.retry_at.items() if k[0] != link.port}
         self.notify(f"Deck {self.config.deck(link.deck_id)['name']} getrennt")
 
     def _candidates(self):
@@ -1430,11 +1598,36 @@ class DeckManager(threading.Thread):
         Ein Port, der beim Abfragen kein Deck war, wird erst nach Ab- und Wiederanstecken neu gefragt."""
         ports = [p for p in list_ports.comports() if p.vid in ESP_VIDS]
         present = {(p.device, p.hwid) for p in ports}
+        now = time.time()
         with self.lock:
             self.not_deck &= present  # abgesteckt: vergessen
-            return [p for p in ports if p.device not in self.busy_ports and (p.device, p.hwid) not in self.not_deck]
+            self.fails = {k: v for k, v in self.fails.items() if k in present}
+            self.retry_at = {k: v for k, v in self.retry_at.items() if k in present}
+            return [p for p in ports if p.device not in self.busy_ports and (p.device, p.hwid) not in self.not_deck
+                    and self.retry_at.get((p.device, p.hwid), 0) <= now]
 
-    def _probe(self, port):
+    def _known(self, p):
+        """Port eines schon bekannten Decks? Espressif-USB trägt die MAC als Seriennummer – so wird das Deck
+        auch an einer anderen Buchse erkannt (die gespeicherte hwid enthält die Buchse als LOCATION)."""
+        known = self.config.deck_ports()
+        if p.hwid in known:
+            return True
+        sn = p.serial_number
+        return bool(sn) and any(f"SER={sn} " in h for h in known)
+
+    def set_usb_paused(self, on):
+        """USB-Suche anhalten (z. B. zum Flashen anderer Boards): kein COM-Port wird mehr geöffnet,
+        verbundene Decks bleiben. Beim Fortsetzen alle Ports neu fragen."""
+        with self.lock:
+            self.usb_paused = on
+            if not on:
+                self.not_deck.clear()
+                self.fails.clear()
+                self.retry_at.clear()
+        if not on:
+            self.rescan.set()
+
+    def _probe(self, port, tries=4):
         ser = serial.Serial()
         ser.port = port
         ser.baudrate = BAUD
@@ -1449,7 +1642,7 @@ class DeckManager(threading.Thread):
         try:
             time.sleep(0.3)
             ser.reset_input_buffer()
-            for _ in range(4):
+            for i in range(tries):
                 ser.write(b"\nHELLO\n")
                 end = time.time() + 1.0
                 while time.time() < end:
@@ -1463,24 +1656,45 @@ class DeckManager(threading.Thread):
                                 fw = 1
                             return (ser, parts[4], parts[5], fw, (parts[7] if len(parts) >= 8 else "none"),
                                     _int(parts[2]))
-                time.sleep(0.5)  # evtl. bootet das Board gerade noch
+                if i < tries - 1:
+                    time.sleep(0.5)  # evtl. bootet das Board gerade noch
         except (serial.SerialException, OSError):
             pass
         ser.close()
         return False  # geöffnet, aber keine Deck-Antwort (None = Port belegt, später noch mal versuchen)
 
+    KNOWN_TRIES = 3       # bekannter Deck-Port: so viele Suchläufe gründlich fragen (Deck bootet evtl. gerade) ...
+    KNOWN_BACKOFF = 60.0  # ... danach nur noch alle 60 s kurz
+    ESP_TRIES = 3         # unbekannter Espressif-Port: nach 3 Suchläufen ohne Antwort in Ruhe lassen
+
     def scan_once(self):
+        if self.usb_paused:
+            return
         for p in self._candidates():
-            res = self._probe(p.device)
-            # Espressif-USB ist immer ein ESP32, und an einem Port, an dem schon ein Deck war, weiter fragen
-            # (das Deck kann beim ersten Versuch beschäftigt sein, z. B. nach einem Neustart)
-            if res is False and p.vid != 0x303A and p.hwid not in self.config.deck_ports():
+            if self.usb_paused:
+                return
+            key = (p.device, p.hwid)
+            known = self._known(p)
+            res = self._probe(p.device, 4 if known and self.fails.get(key, 0) < self.KNOWN_TRIES else 1)
+            if res is False:
                 with self.lock:
-                    self.not_deck.add((p.device, p.hwid))
-                log.info("%s (%s) ist kein Deck – wird erst nach neuem Anstecken wieder gefragt",
-                         p.device, p.description)
+                    n = self.fails[key] = self.fails.get(key, 0) + 1
+                    if known:
+                        if n >= self.KNOWN_TRIES:
+                            self.retry_at[key] = time.time() + self.KNOWN_BACKOFF
+                    elif p.vid != 0x303A or n >= self.ESP_TRIES:
+                        self.not_deck.add(key)
+                if known and n == self.KNOWN_TRIES:
+                    log.info("%s (%s): Deck antwortet nicht – wird nur noch alle %d s gefragt",
+                             p.device, p.description, self.KNOWN_BACKOFF)
+                elif key in self.not_deck:
+                    log.info("%s (%s) ist kein Deck – wird erst nach neuem Anstecken wieder gefragt",
+                             p.device, p.description)
             if not res:
                 continue
+            with self.lock:
+                self.fails.pop(key, None)
+                self.retry_at.pop(key, None)
             ser, deck_id, deck_hash, fw, theme_hash, width = res
             with self.lock:
                 old = self.links.get(deck_id)

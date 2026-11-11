@@ -47,7 +47,7 @@
 #ifndef LOGO_TM
 #define LOGO_TM 0
 #endif
-#define FW_VERSION "37"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
+#define FW_VERSION "40"  // 2 = Live-Kacheln (UPD, SHOW), 3 = langer Tipper (LONG), 4 = PING/Status,
                         // 5 = flimmerfreies Zeichnen (Seite im PSRAM), 6 = Plus-Kachel (CLR, leere Plätze),
                         // 7 = Löschen per Sicherheitsabfrage (DEL), 8 = Design (Startbild, Seitenbild, Glas-Kacheln),
                         // 9 = ohne Verbindung zur PC-App nur das Logo, 10 = Drehgeber (ROT, KNOB, KNOBLONG),
@@ -77,6 +77,9 @@
                         //      WLAN-Abfrage nur unten antippbar
                         // 36 = Wanderer als Block-Figur (12x32, steif schwingende Arme/Beine)
                         // 37 = WLAN-Diagnose (WSTAT): Signal und Grund der letzten Trennung, auch im Display
+                        // 38 = Drucker ohne PC-App (PRINTER, nur Deck 2): langer Tipper aufs Ruhebild
+                        // 39 = bis zu 16 Seiten (vorher 8)
+                        // 40 = Kachel am Deck verschieben: 0,6 s halten, ziehen, loslassen (MOVE)
 // Deck-Typ: die PC-App spielt nur eine Firmware mit demselben Typ auf
 #ifndef DECK_TYPE
 #if CONFIG_IDF_TARGET_ESP32S3
@@ -126,7 +129,7 @@ __attribute__((used)) static const char FW_TAG[] = "PCDECK-FW " FW_VERSION " " D
 #define ICON_SZ 64
 #define ICON_BYTES (ICON_SZ * ICON_SZ * 2)
 #define NAV_H 40
-#define MAX_PAGES 8
+#define MAX_PAGES 16  // ab FW 39 (vorher 8)
 #define MAX_COLS 5
 #define MAX_ROWS 3
 
@@ -191,6 +194,14 @@ static String deckId;
 static uint32_t lastPcContact = 0;
 static bool pcSeen = false;
 static bool pcOk = false;  // PC-App verbunden? false: nur das Logo (PC startet, Anmeldung, App beendet)
+// Drucker ohne PC-App (printer_offline.h, ab FW 38)
+static volatile bool prOn = false;  // Drucker-Seite wird ohne App gezeigt
+static bool prDrawTile(lgfx::LovyanGFX& g, int x, int y, int w, int h, int i);
+static void prTouch(bool touched, bool down, int32_t tx, int32_t ty, uint32_t now);
+static void prKnobPress();
+static void prRotate(int n);
+static void prTryEnter();
+static void prHandleLine(char* arg);
 
 // Anzeige-Optionen der PC-App (OPT, ab FW 27; nur RAM, die App schickt sie bei jeder Verbindung)
 static bool optBuild = false;     // Seitenwechsel: Kacheln nacheinander zeigen (wie ohne PSRAM)
@@ -223,6 +234,7 @@ struct Live {
 };
 static Live live[MAX_COLS * MAX_ROWS];
 static int downTile = -1;   // gerade gedrückte Kachel (für Rahmen beim Neuzeichnen)
+static int dragTarget = -1; // Verschieben (ab FW 40): Zielplatz unter dem Finger, Rahmen auch auf leerem Platz
 static bool longSent = false;     // 0,6 s erreicht: beim Loslassen LONG statt PRESS (Rahmen gelb)
 static bool deleteArmed = false;  // 1,5 s erreicht: Sicherheitsabfrage "loeschen?" (Rahmen rot)
 
@@ -434,6 +446,10 @@ static void drawTileTo(lgfx::LovyanGFX& g, LGFX_Sprite* spr, int ox, int oy, int
       g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 9, c);
       g.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 8, c);
     }
+    if (prOn && prDrawTile(g, x, y, w, h, i)) {
+      if (fx) drawBorderTo(*spr, ox, oy);
+      return;
+    }
 
     g.setFont(&fonts::Font2);
     g.setTextColor(COL_TEXT);  // ohne Hintergrund: Schrift direkt auf Kachel bzw. Verlauf
@@ -475,6 +491,11 @@ static void drawTileTo(lgfx::LovyanGFX& g, LGFX_Sprite* spr, int ox, int oy, int
       g.drawString(fitText(g, label, w - 6), x + w / 2, y + h / 2);
     }
   }
+  if (i == dragTarget) {  // Ziel beim Verschieben (ab FW 40), auch auf einem leeren Platz
+    g.drawRoundRect(x, y, w, h, 10, COL_ACCENT);
+    g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 9, COL_ACCENT);
+    g.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 8, COL_ACCENT);
+  }
   if (fx) drawBorderTo(*spr, ox, oy);
 }
 
@@ -500,7 +521,7 @@ static void drawNetBadge() {
 }
 
 static void drawOsd() {
-  if (!osdUntil || confirmActive || !pcOk) return;
+  if (!osdUntil || confirmActive || (!pcOk && !prOn)) return;
   LGFX_Sprite s(&tft);
   s.setPsram(haveFrame);
   s.setColorDepth(16);
@@ -528,7 +549,7 @@ static void drawOsd() {
 
 // Eine Kachel neu zeichnen und auf einen Schlag anzeigen
 static void drawTile(int i, bool pressed = false, bool isLong = false) {
-  if (confirmActive || !pcOk) return;  // Sicherheitsabfrage bzw. Logo liegt darüber
+  if (confirmActive || (!pcOk && !prOn)) return;  // Sicherheitsabfrage bzw. Logo liegt darüber
   if (buildNext >= 0) {  // Aufbau läuft (z. B. Live-Kachel nach SHOW): im Seitenbild nachtragen
     drawTileTo(frame, &frame, 0, 0, i, pressed, isLong);
     if (i >= buildNext) return;  // wird gleich der Reihe nach aufgedeckt
@@ -1207,7 +1228,7 @@ static void drawKnobFrame(bool on) {
 
 static void drawPage() {
   if (confirmActive) return;
-  if (!pcOk) {  // PC-App meldet sich nicht (PC startet, Anmeldebildschirm, App beendet): Logo bzw. Uhr
+  if (!pcOk && !prOn) {  // PC-App meldet sich nicht (PC startet, Anmeldebildschirm, App beendet): Logo bzw. Uhr
     buildNext = -1;
     lastDrawnPage = -1;
     clockShownMin = -1;
@@ -1395,6 +1416,7 @@ static bool loadCalibration() {
 //   PRESS <seite> <kachel>          -> kurz angetippt (beim Loslassen)
 //   LONG <seite> <kachel>           -> 0,6-1,5 s gedrückt, beim Loslassen (statt PRESS; ab FW 3, ab FW 7 beim Loslassen)
 //   DEL <seite> <kachel>            -> Kachel nach Sicherheitsabfrage löschen (1,5 s halten; ab FW 7)
+//   MOVE <seite> <von> <nach>       -> Kachel 0,6 s gehalten und auf einen anderen Platz gezogen (ab FW 40)
 //   SHOW <seite>                   -> am Deck geblättert (ab FW 2)
 //   ROT <+n|-n>                    -> Drehgeber um n Rasten gedreht, + = im Uhrzeigersinn (ab FW 10)
 //   KNOB / KNOBLONG                 -> Drehgeber-Taster kurz / ab 0,6 s gedrückt, beim Loslassen (ab FW 10)
@@ -1733,6 +1755,7 @@ static void handleLine(char* line) {
   pcSeen = true;
   if (!pcOk) {  // App ist (wieder) da: Logo weg, Kacheln zeigen
     pcOk = true;
+    prOn = false;  // Drucker-Betrieb ohne App endet, die App zeichnet
     drawPage();
   }
 
@@ -2175,6 +2198,8 @@ static void handleLine(char* line) {
     drawPage();
   } else if (strncmp(line, "WIFI ", 5) == 0) {
     handleWifi(line + 5);
+  } else if (strncmp(line, "PRINTER ", 8) == 0) {
+    prHandleLine(line + 8);  // ab FW 38: Drucker-Seite für den Betrieb ohne App
   } else if (line[0] != 0) {
     io->println("ERR unknown");
   }
@@ -2404,7 +2429,7 @@ static const int WA_Y = 200, WA_H = 64, WA_W = 170;
 static const int WA_NO_X = 50, WA_YES_X = SCREEN_W - 50 - WA_W;
 
 static void drawWifiOverlay() {
-  if (pcOk) return;
+  if (pcOk || prOn) return;
   if (wifiAsk) {
     tft.startWrite();
     tft.fillRoundRect(20, 40, SCREEN_W - 40, 250, 14, COL_TILE);
@@ -2493,7 +2518,7 @@ static void pollWifiPower() {
     wifiAsk = true;
     drawPage();
   }
-  if (wifiActive && !pcOk && !wifiAsk && now - lastHint > 2000) {  // Hinweis unten aktuell halten (IP)
+  if (wifiActive && !pcOk && !prOn && !wifiAsk && now - lastHint > 2000) {  // Hinweis unten aktuell halten (IP)
     lastHint = now;
     drawWifiOverlay();
   }
@@ -2506,6 +2531,8 @@ static bool wasDown = false;
 static uint32_t lastSeenDown = 0;
 static uint32_t downSince = 0;
 static int downNav = 0;     // -1 zurück, +1 weiter
+static int32_t downX = 0, downY = 0;  // wo der Finger aufgesetzt hat
+static bool dragging = false;         // lang gehaltene Kachel wird gezogen (ab FW 40)
 
 // ---------------------------------------------------------------- Sicherheitsabfrage
 static const int CB_Y = 200, CB_H = 64, CB_W = 170;          // Knöpfe der Abfrage
@@ -2589,10 +2616,24 @@ static void pollTouch() {
     wasDown = down;
     return;
   }
-  if (!pcOk) {  // Logo: Tipper werden ignoriert – außer unten (WLAN-Abfrage) und 5x schnell oben (Monsterkampf)
+  if (prOn) {  // Drucker-Seite ohne App (printer_offline.h)
+    prTouch(touched, down, tx, ty, now);
+    wasDown = down;
+    return;
+  }
+  if (!pcOk) {  // Logo: Tipper werden ignoriert – außer unten (WLAN-Abfrage), 5x schnell oben (Monsterkampf)
+    static uint32_t holdAt = 0;  // lang gehalten (ab FW 38): Drucker-Seite ohne App
+    if (down && touched && holdAt && now - holdAt >= LONG_MS && ty < SCREEN_H - WIFI_TAP_H) {
+      holdAt = 0;
+      prTryEnter();
+      wasDown = down;
+      return;
+    }
+    if (!down) holdAt = 0;
     if (down && !wasDown && touched) {
       static uint32_t tapAt[5] = {0};
       static int tapN = 0;
+      holdAt = now ? now : 1;
       if (ty >= SCREEN_H - WIFI_TAP_H) {
         reopenWifiAsk();
       } else {
@@ -2620,7 +2661,11 @@ static void pollTouch() {
     downNav = 0;
     longSent = false;
     deleteArmed = false;
+    dragging = false;
+    dragTarget = -1;
     downSince = now;
+    downX = tx;
+    downY = ty;
     if (ty >= gridH()) {
       if (tx < 120) downNav = -1;
       else if (tx > SCREEN_W - 120) downNav = 1;
@@ -2643,8 +2688,29 @@ static void pollTouch() {
     drawTile(downTile, true, true);
     tft.endWrite();
   }
-  // 1,5 s: Rahmen rot und sofort die Sicherheitsabfrage (nur für gespeicherte Kacheln)
-  if (down && downTile >= 0 && !deleteArmed && now - downSince >= DELETE_MS && findTile(curPage, downTile)) {
+  // ab 0,6 s und eine halbe Kachel weit gezogen: verschieben (nur gespeicherte Kacheln, ab FW 40)
+  if (touched && downTile >= 0 && longSent && findTile(curPage, downTile)) {
+    int cw = SCREEN_W / gCols, chh = gridH() / gRows;
+    if (!dragging && (abs(tx - downX) > cw / 2 || abs(ty - downY) > chh / 2)) dragging = true;
+    if (dragging) {
+      int t = -1;
+      if (ty < gridH()) {
+        int c = tx / cw, r = ty / chh;
+        if (c < gCols && r < gRows) t = r * gCols + c;
+      }
+      if (t == downTile) t = -1;
+      if (t != dragTarget) {
+        int old = dragTarget;
+        dragTarget = t;
+        tft.startWrite();
+        if (old >= 0) drawTile(old, false);
+        if (t >= 0) drawTile(t, false);
+        tft.endWrite();
+      }
+    }
+  }
+  // 1,5 s: Rahmen rot und sofort die Sicherheitsabfrage (nur für gespeicherte Kacheln, nicht beim Ziehen)
+  if (down && downTile >= 0 && !dragging && !deleteArmed && now - downSince >= DELETE_MS && findTile(curPage, downTile)) {
     deleteArmed = true;
     tft.startWrite();
     drawTile(downTile, true, true);
@@ -2657,7 +2723,15 @@ static void pollTouch() {
   }
 
   if (!down && wasDown) {
-    if (downTile >= 0) {
+    if (downTile >= 0 && dragging) {  // verschoben: die App tauscht und schickt beide Plätze neu (TSET/TDEL)
+      int t = dragTarget;
+      dragTarget = -1;
+      tft.startWrite();
+      drawTile(downTile, false);
+      if (t >= 0) drawTile(t, false);
+      tft.endWrite();
+      if (t >= 0) io->printf("MOVE %d %d %d\n", curPage, downTile, t);
+    } else if (downTile >= 0) {
       tft.startWrite();
       drawTile(downTile, false);
       tft.endWrite();
@@ -2672,6 +2746,7 @@ static void pollTouch() {
     downNav = 0;
     longSent = false;
     deleteArmed = false;
+    dragging = false;
   }
   wasDown = down;
 }
@@ -2701,6 +2776,7 @@ static void pollKnobButton() {
   } else if (!raw && swDown) {
     swDown = false;
     if (pcOk && !swTurned) io->println(now - swSince >= KNOB_LONG_MS ? "KNOBLONG" : "KNOB");
+    else if (prOn && !swTurned) prKnobPress();
     else if (!pcOk && !swTurned) reopenWifiAsk();
   }
   bool want = swDown && !swTurned && pcOk && !confirmActive && now - swSince >= KNOB_LONG_MS;
@@ -2749,12 +2825,15 @@ static void pollEncoder() {
   if (ENC_REVERSE) detents = -detents;
   if (swDown) swTurned = true;  // gedrückt gedreht: zweite Belegung, Loslassen zählt nicht als Druck
   if (pcOk) io->printf(swDown ? "ROTP %+d\n" : "ROT %+d\n", (int)detents);
+  else if (prOn && !swDown) prRotate((int)detents);
 }
 #else
 static void setupEncoder() {}
 static void pollEncoder() {}
 #endif
 
+
+#include "printer_offline.h"
 
 // ---------------------------------------------------------------- Setup/Loop
 void setup() {
@@ -2827,6 +2906,7 @@ void setup() {
 #endif
   setupEncoder();
   loadWifi();
+  prSetup();
 }
 
 // Statuspunkt aktualisieren: PC-App gilt als getrennt, wenn sie sich PC_TIMEOUT_MS nicht meldet
@@ -2857,7 +2937,7 @@ static void pollDim() {
 
 // Uhr im Ruhebild zur vollen Minute erneuern
 static void pollClock() {
-  if (pcOk || !clockValid() || confirmActive || fightOn) return;  // im Kampf zeichnet pollFight alles
+  if (pcOk || prOn || !clockValid() || confirmActive || fightOn) return;  // im Kampf zeichnet pollFight alles
   struct tm t;
   localTime(t);
   if (t.tm_hour * 60 + t.tm_min == clockShownMin) return;
@@ -2871,7 +2951,7 @@ static void pollClock() {
 }
 
 // Figuren: zufällig alle 2–5 Minuten eine; tagsüber der Wanderer, nachts Zombie, Skelett oder Spinne
-static bool worldIdle() { return !pcOk && clockValid() && optWorld && optWalkers && !confirmActive && !wifiAsk; }
+static bool worldIdle() { return !pcOk && !prOn && clockValid() && optWorld && optWalkers && !confirmActive && !wifiAsk; }
 
 static void startFight() {
   wResetDamage();
@@ -3227,5 +3307,6 @@ void loop() {
   pollWalker();
   pollFight();
   pollNtp();
+  pollPrinter();
   delay(5);
 }
