@@ -70,6 +70,7 @@ Heimnetz – ohne Cloud, die Bosch-App funktioniert weiter. Geht, solange PC-Dec
 | kurz tippen | Programm öffnen bzw. minimieren / zurückholen |
 | lang tippen (gelber Rahmen, 0,6 s) | Programm höflich schließen (Speichern-Dialog erscheint) |
 | 1,5 s halten (roter Rahmen) | Kachel löschen – mit Sicherheitsabfrage |
+| 0,6 s halten, dann ziehen | Kachel auf einen anderen Platz der Seite verschieben, ein belegter Platz tauscht (ab Firmware 1.040, Big-Deck ab Display-Firmware 40) |
 | `<` `>` unten | Seiten blättern |
 | grüner Rahmen | dieses Programm ist gerade im Vordergrund |
 
@@ -167,6 +168,19 @@ Hintergrundlicht sind am Display nicht herausgeführt (Licht immer an).
 | SPI MOSI | MOSI | GPIO23 |
 | SPI MISO | MISO | GPIO19 |
 | Drehgeber A / B / Taster | – | GPIO25 / GPIO26 / GPIO33 (gemeinsam an GND) |
+
+### Big-Deck (CrowPanel 9" ESP32-P4)
+
+Das 9"-Display (1024×600) ist zugleich CNC-Display. Seine Firmware liegt nicht hier, sondern im Projekt
+[grblHAL-Plugin-Display](https://github.com/Steppge/grblHAL-Plugin-Display) (Ordner `esp32p4`, Abschnitt
+„CrowPanel 9" ESP32-P4“ der README dort).
+
+- Der PC-Deck-Modus ist dort beim Bauen **standardmäßig aus** (`BIGDECK 0` in `esp32p4/src/display_config.h`).
+  Für das Big-Deck in `esp32p4/src/my_display_config.h` die Zeile `#define BIGDECK 1` eintragen und die
+  Firmware selbst bauen.
+- Mit `BIGDECK 0` antwortet das Display nicht auf die PC-App (kein `HELLO`, keine Taste „PC“, kein
+  Deck-Server über WLAN auf TCP 5555 / UDP 5556) – die App findet es dann nicht.
+- Die App erkennt das Big-Deck selbst (Breite 1024) und zeigt bis zu 6×4 Kacheln und einen Lautstärke-Regler.
 
 ## 9. Firmware aktualisieren
 

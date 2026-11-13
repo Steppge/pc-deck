@@ -48,6 +48,9 @@ if os.name == "nt":
     kernel32.OpenProcess.restype = wt.HANDLE
     kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
     kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+    ctypes.windll.ntdll.NtQueryInformationProcess.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+                                                              ctypes.POINTER(wt.ULONG)]
 
 GW_OWNER = 4
 WM_CLOSE = 0x0010
@@ -332,6 +335,153 @@ def knob_app(path):
         return None
     exe = os.path.basename(buf.value).lower()
     return exe if exe.endswith(".exe") else None
+
+
+def browser_exe():
+    """Vollständiger Pfad des Standard-Browsers (Programm für https-Adressen) oder None."""
+    if os.name != "nt":
+        return None
+    buf = ctypes.create_unicode_buffer(520)
+    n = ctypes.c_ulong(520)
+    if ctypes.windll.shlwapi.AssocQueryStringW(0, 2, "https", None, buf, ctypes.byref(n)) != 0:
+        return None
+    return buf.value if buf.value.lower().endswith(".exe") else None
+
+
+def installed_browsers():
+    """Installierte Browser laut Windows (StartMenuInternet): [(pfad zur exe, name)]."""
+    found = {}
+    if os.name != "nt":
+        return []
+    import winreg
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            base = winreg.OpenKey(root, r"SOFTWARE\Clients\StartMenuInternet")
+        except OSError:
+            continue
+        with base:
+            for k in range(64):
+                try:
+                    sub = winreg.EnumKey(base, k)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(base, sub) as s:
+                        name = winreg.QueryValueEx(s, "")[0] or sub
+                    with winreg.OpenKey(base, sub + r"\shell\open\command") as c:
+                        cmd = winreg.QueryValueEx(c, "")[0]
+                except OSError:
+                    continue
+                exe = cmd.split('"')[1] if cmd.startswith('"') else cmd.split()[0]
+                if exe.lower().endswith(".exe") and os.path.isfile(exe):
+                    found.setdefault(os.path.normcase(exe), (exe, name))
+    return sorted(found.values(), key=lambda x: x[1].lower())
+
+
+def browser_windows(exe):
+    """Sichtbare Hauptfenster des Browsers exe (neueste zuerst wie in der Fensterreihenfolge von Windows)."""
+    want = os.path.normcase(os.path.normpath(exe))
+    m = lambda e: os.path.normcase(os.path.normpath(e)) == want  # noqa: E731
+    m.name = ntpath.basename(exe).lower()
+    return _app_windows(m)
+
+
+# ----------------------------------------------------------------- eigene Browser-Instanz (Stream-Fenster)
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort), ("Buffer", ctypes.c_void_p)]
+
+
+def _cmdline(pid):
+    """Befehlszeile eines Prozesses ("" wenn nicht lesbar); ProcessCommandLineInformation ab Windows 8.1."""
+    if os.name != "nt":
+        return ""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return ""
+    try:
+        nt = ctypes.windll.ntdll
+        size = wt.ULONG(0)
+        nt.NtQueryInformationProcess(h, 60, None, 0, ctypes.byref(size))
+        if not size.value:
+            return ""
+        buf = ctypes.create_string_buffer(size.value)
+        if nt.NtQueryInformationProcess(h, 60, buf, size, ctypes.byref(size)) != 0:
+            return ""
+        us = _UNICODE_STRING.from_buffer(buf)
+        return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer and us.Length else ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def instance_pids(exe, marker):
+    """Prozesse aus dem Programmordner von exe, deren Befehlszeile marker enthält (den eigenen Profil-Ordner).
+    So findet die App ihre eigene Browser-Instanz, auch nach einem Neustart von PC-Deck."""
+    base = os.path.normcase(os.path.dirname(exe)) + os.sep
+    want = os.path.normcase(marker)
+    cache, found = {}, set()
+    for pid in list(_processes()):
+        path = os.path.normcase(_exe_of(pid, cache))
+        if path.startswith(base) and want in os.path.normcase(_cmdline(pid)):
+            found.add(pid)
+    return found
+
+
+def pid_windows(pids):
+    """Sichtbare Hauptfenster dieser Prozesse."""
+    found = []
+
+    def cb(hwnd, _):
+        if (user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, GW_OWNER)
+                and user32.GetWindowTextLengthW(hwnd) > 0):
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                found.append(hwnd)
+        return True
+
+    if pids:
+        user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return found
+
+
+def close_instance(exe, marker, timeout=3.0):
+    """Eigene Browser-Instanz schließen: erst höflich (Fenster schließen), nach timeout hart beenden.
+    True, wenn danach keiner ihrer Prozesse mehr läuft."""
+    pids = instance_pids(exe, marker)
+    if not pids:
+        return True
+    for hwnd in pid_windows(pids):
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.2)
+        _procs_cache["t"] = -1.0
+        if not instance_pids(exe, marker):
+            return True
+    log.info("Stream-Fenster reagiert nicht – beende es")
+    for pid in instance_pids(exe, marker):
+        h = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if h:
+            kernel32.TerminateProcess(h, 1)
+            kernel32.CloseHandle(h)
+    time.sleep(0.5)
+    _procs_cache["t"] = -1.0
+    return not instance_pids(exe, marker)
+
+
+def bring_to_front(hwnd, timeout=1.5):
+    """Fenster (auch minimiert) nach vorne holen; True, wenn es danach wirklich vorne ist."""
+    if not user32.IsWindow(hwnd):
+        return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    end = time.time() + timeout
+    while time.time() < end:
+        _foreground(hwnd)
+        time.sleep(0.1)
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+    return False
 
 
 def folder_target(path):
